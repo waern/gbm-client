@@ -29,6 +29,7 @@ import Network.Curl
 import Network.Curl.Aeson
 import Network.URI
 import Network.Wreq hiding (Auth)
+import qualified Network.HTTP.Client as HTTP.Client
 import Prelude hiding (id, log)
 import Safe
 import System.Console.CmdArgs hiding (name)
@@ -290,12 +291,13 @@ addGames games meta =
   meta {game_collection = collection, wishlist = wishlist meta \\ collection}
 
 getCustomerMetadata :: Auth -> CustomerId -> IO (Maybe Value)
-getCustomerMetadata aut cid =
-  (Just <$> call aut "GET" ("/customers/" ++ show cid ++ "/metadata/") noData) `catch`
-    \case
-        -- XXX: we should distinguish 404 from other errors here
-      CurlAesonException {curlCode = CurlHttpReturnedError} -> pure Nothing -- interpret as 404
-      e -> do warn "unexpected exception using customer meta data end point"; throw e
+getCustomerMetadata aut cid = do
+  r <- try $ call aut "GET" ("/customers/" ++ show cid ++ "/metadata/") noData
+  case r of
+    -- XXX: we should distinguish 404 from other errors here
+    Left (CurlAesonException {curlCode = CurlHttpReturnedError}) -> pure Nothing -- interpret as 404
+    Left e -> do warn "unexpected exception using customer meta data end point"; throwIO e
+    Right x -> pure x
   {-
     Wreq doesn't work due to HandshakeFailed from tls package (bug?)
     let opts = Network.Wreq.defaults & Network.Wreq.auth ?~ basicAuth (ByteString.Char8.pack user) (ByteString.Char8.pack pw)
@@ -516,32 +518,41 @@ queryBGG customer username 0 = do
   warnCustomerBGG customer username "gave up trying to get gameboardgeek.com collection."
   pure []
 queryBGG customer username tries = do
-  r <- Network.Wreq.get url
-  case r ^. responseStatus . statusCode of
-    202 -> do
-      log $ "Access to gameboardgeek.com game collection for user " <> username <> " accepted."
-      log "Waiting three seconds before resending request..."
-      threadDelay 3000000
-      queryBGG customer username (tries - 1)
-    200 -> do
-      log $ "Querying BGG collection for user: " <> username
-      let tags = parseTags (r ^. responseBody)
-      let text (_ : TagText str : _) = pure (Just str)
-          text _ = do warn "unexpected XML format"; pure Nothing
-      let message ts = do
-            msgs <- mapM text $ sections (~== ("<message>" :: String)) ts
-            pure (Text.unlines $ map (decodeUtf8 . BL.toStrict) $ catMaybes msgs)
-      errors <- mapM message $ sections (~== ("<error>" :: String)) tags
-      unless (null errors) (warnCustomerBGG customer username $ "BGG API error: " <> Text.unlines errors)
-      mapM extractGame $ sections (~== ("<item>" :: String)) tags
-    _ -> do
-      let msg = Text.pack $ show (r ^. responseStatus)
-      warn $ "gameboardgeek.com API returned error: " <> msg
-      pure []
+  x <- try $ Network.Wreq.get url
+  case x of
+    Left HTTP.Client.NoResponseDataReceived -> do
+      log $ "No response data received from gameboardgeek.com trying to get game collection for user " <> username <> "."
+      retry
+    Left e ->
+      throwIO e
+    Right r ->
+      case r ^. responseStatus . statusCode of
+        202 -> do
+          log $ "Access to gameboardgeek.com game collection for user " <> username <> " accepted."
+          retry
+        200 -> do
+          log $ "Querying BGG collection for user: " <> username
+          let tags = parseTags (r ^. responseBody)
+          let text (_ : TagText str : _) = pure (Just str)
+              text _ = do warn "unexpected XML format"; pure Nothing
+          let message ts = do
+                msgs <- mapM text $ sections (~== ("<message>" :: String)) ts
+                pure (Text.unlines $ map (decodeUtf8 . BL.toStrict) $ catMaybes msgs)
+          errors <- mapM message $ sections (~== ("<error>" :: String)) tags
+          unless (null errors) (warnCustomerBGG customer username $ "BGG API error: " <> Text.unlines errors)
+          mapM extractGame $ sections (~== ("<item>" :: String)) tags
+        _ -> do
+          let msg = Text.pack $ show (r ^. responseStatus)
+          warn $ "gameboardgeek.com API returned error: " <> msg
+          pure []
   where
     -- BGG usernames may, for example, contain spaces
     escaped_username = escapeURIString isUnescapedInURIComponent (Text.unpack username)
     url = "http://www.boardgamegeek.com/xmlapi/collection/" ++ escaped_username ++ "?own=1"
+    retry = do
+      log "Waiting three seconds before resending request..."
+      threadDelay 3000000
+      queryBGG customer username (tries - 1)
 
 getBGGCollection :: Customer -> Text -> IO [Game]
 getBGGCollection customer username = queryBGG customer username 10

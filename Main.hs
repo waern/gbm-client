@@ -27,13 +27,13 @@ import Data.Text.Encoding
 import GHC.Generics hiding (to)
 import Network.Curl
 import Network.Curl.Aeson
+import Network.URI
 import Network.Wreq hiding (Auth)
 import Prelude hiding (id, log)
 import Safe
 import System.Console.CmdArgs hiding (name)
 import System.Exit
 import Text.HTML.TagSoup
-import Network.URI
 import qualified Control.Logging as Logging
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Lazy.UTF8 as BL.UTF8
@@ -183,7 +183,7 @@ data Prefs = Prefs
   , pStrategy :: Int
   , p2Player :: Int
   , p3Player :: Int
-  } deriving (Generic, Show)
+  } deriving Show
 
 -- TODO: change names in JSON/frontend?
 instance FromJSON Prefs where
@@ -380,7 +380,7 @@ readGames fp = do
 -- Shipment file
 -----------------------------------------------------------------------------
 
-data ShipmentRecord = ShipmentRecord Customer Address Game deriving (Generic, Show)
+data ShipmentRecord = ShipmentRecord Customer Address Game deriving Show
 
 instance Csv.DefaultOrdered ShipmentRecord where
   headerOrder _ = Csv.header
@@ -455,7 +455,6 @@ updateCollection aut (ShipmentRecord customer _ game) = do
 
 -----------------------------------------------------------------------------
 -- Matching algorithm
--- (
 -----------------------------------------------------------------------------
 
 score :: Prefs -> InventoryGame -> Int
@@ -659,7 +658,7 @@ doCommit aut fp = do
 
 readConfig :: IO Auth
 readConfig = do
-  config <- Configurator.load [Configurator.Required "haystack.cfg"]
+  config <- Configurator.load [Configurator.Required "gbm-client.cfg"]
   username <- Configurator.require config "cratejoy.username"
   password <- Configurator.require config "cratejoy.password"
   pure (username, password)

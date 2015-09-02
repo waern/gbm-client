@@ -13,6 +13,7 @@ import Control.Concurrent
 import Control.Exception
 import Control.Lens hiding ((+=), (.=), to)
 import Control.Monad
+import Data.String
 import Data.Aeson
 import Data.Aeson.Types
 import Data.Csv ((.!))
@@ -30,6 +31,7 @@ import Network.Curl.Aeson
 import Network.URI
 import Network.Wreq hiding (Auth)
 import qualified Network.HTTP.Client as HTTP.Client
+import qualified Network.HTTP.Types as HTTP.Types
 import Prelude hiding (id, log)
 import Safe
 import System.Console.CmdArgs hiding (name)
@@ -38,6 +40,7 @@ import Text.HTML.TagSoup
 import qualified Control.Logging as Logging
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Lazy.UTF8 as BL.UTF8
+import qualified Data.ByteString.UTF8 as B.UTF8
 import qualified Data.Configurator as Configurator
 import qualified Data.Csv as Csv
 import qualified Data.HashMap.Strict as HashMap
@@ -80,10 +83,10 @@ cratejoyApiUrl :: String
 cratejoyApiUrl = "https://api.cratejoy.com/v1"
 
 call :: (ToJSON a, FromJSON b) => Auth -> String -> String -> Maybe a -> IO b
-call (user, pw) meth service = curlAeson parseJSON meth uri userpw
+call (user, pw) meth service = curlAeson parseJSON meth uri opts
   where
     uri = cratejoyApiUrl ++ service
-    userpw = [CurlUserPwd (user ++ ":" ++ pw)]
+    opts = [CurlUserPwd (user ++ ":" ++ pw), CurlSSLVersion 1 {- TLS -}]
 
 parseResults :: FromJSON a => Value -> Parser a
 parseResults (Object o) = o .: "results"
@@ -501,49 +504,57 @@ match games customers =
 -- BGG game collections
 -----------------------------------------------------------------------------
 
-warnCustomerBGG :: Customer -> Text -> Text -> IO ()
-warnCustomerBGG customer username msg =
-  warnCustomer customer (msg <> " Username: " <> username)
+forUser :: (Monoid a, IsString a) => a -> a -> a
+forUser username msg = msg <> fromString ", querying collection for user: " <> username
 
-extractGame :: [Tag BL.ByteString] -> IO Game
-extractGame = \case
+extractGame :: Text -> [Tag BL.ByteString] -> IO Game
+extractGame username = \case
   (TagOpen "item" attrs : TagText _ : TagOpen "name" _ : TagText name : _)
     | Just x <- lookup "objectid" attrs,
       Just gameId <- readMay (BL.UTF8.toString x) ->
         pure Game {gameId, gameTitle = decodeUtf8 $ BL.toStrict name}
-  _ -> die "Unexpected BGG response"
+  _ -> die ("Unexpected BGG response" `forUser` Text.unpack username)
+
+extractGames :: Text -> BL.ByteString -> IO [Game]
+extractGames username body = do
+  let tags = parseTags body
+  errors <- mapM message $ sections (~== ("<error>" :: String)) tags
+  unless (null errors) (warn ("BGG API error: " <> Text.unlines errors `forUser` username))
+  mapM (extractGame username) $ sections (~== ("<item>" :: String)) tags
+  where
+    text (_ : TagText str : _) = pure (Just str)
+    text _ = do warn ("unexpected XML format" `forUser` username); pure Nothing
+    message ts = do
+      msgs <- mapM text $ sections (~== ("<message>" :: String)) ts
+      pure (Text.unlines $ map (decodeUtf8 . BL.toStrict) $ catMaybes msgs)
 
 queryBGG :: Customer -> Text -> Int -> IO [Game]
-queryBGG customer username 0 = do
-  warnCustomerBGG customer username "gave up trying to get gameboardgeek.com collection."
-  pure []
+queryBGG customer username 0 = do warn ("Giving up" `forUser` username); pure []
 queryBGG customer username tries = do
+  log $ "Querying BGG collection for user: " <> username
   x <- try $ Network.Wreq.get url
   case x of
+    Left (HTTP.Client.StatusCodeException (HTTP.Types.Status code msg) _ _) ->
+      let m = "Error from BGG: " <> show code <> " " <> B.UTF8.toString msg in
+      die (m `forUser` Text.unpack username)
     Left HTTP.Client.NoResponseDataReceived -> do
-      log $ "No response data received from gameboardgeek.com trying to get game collection for user " <> username <> "."
+      info ("No response data received from BGG" `forUser` username)
+      retry
+    Left HTTP.Client.ResponseTimeout -> do
+      info ("Response timeout from BGG" `forUser` username)
       retry
     Left e ->
       throwIO e
     Right r ->
       case r ^. responseStatus . statusCode of
         202 -> do
-          log $ "Access to gameboardgeek.com game collection for user " <> username <> " accepted."
+          log ("Access to BGG game collection accepted" `forUser` username)
           retry
-        200 -> do
-          log $ "Querying BGG collection for user: " <> username
-          let tags = parseTags (r ^. responseBody)
-          let text (_ : TagText str : _) = pure (Just str)
-              text _ = do warn "unexpected XML format"; pure Nothing
-          let message ts = do
-                msgs <- mapM text $ sections (~== ("<message>" :: String)) ts
-                pure (Text.unlines $ map (decodeUtf8 . BL.toStrict) $ catMaybes msgs)
-          errors <- mapM message $ sections (~== ("<error>" :: String)) tags
-          unless (null errors) (warnCustomerBGG customer username $ "BGG API error: " <> Text.unlines errors)
-          mapM extractGame $ sections (~== ("<item>" :: String)) tags
+        200 ->
+          extractGames username (r ^. responseBody)
         _ -> do
           let msg = Text.pack $ show (r ^. responseStatus)
-          warn $ "gameboardgeek.com API returned error: " <> msg
+          warn ("BGG API returned error: " <> msg `forUser` username)
           pure []
   where
     -- BGG usernames may, for example, contain spaces

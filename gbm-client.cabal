@@ -8,5 +8,5 @@ cabal-version:       >=1.10
 executable gbm-client
   main-is:             Main.hs
   ghc-options:         -Wall
-  build-depends:       base, aeson, lens-aeson, curl, curl-aeson, cassava, bytestring, cmdargs, vector, text, http-client, wreq-sb, lens, tagsoup, utf8-string, logging, configurator, safe, unordered-containers, network-uri
+  build-depends:       base, aeson, lens-aeson, curl, curl-aeson, cassava, bytestring, cmdargs, vector, text, http-types, http-client, wreq-sb, lens, tagsoup, utf8-string, logging, configurator, safe, unordered-containers, network-uri
   default-language:    Haskell2010

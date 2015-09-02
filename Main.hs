@@ -85,7 +85,7 @@ call :: (ToJSON a, FromJSON b) => Auth -> String -> String -> Maybe a -> IO b
 call (user, pw) meth service = curlAeson parseJSON meth uri opts
   where
     uri = cratejoyApiUrl ++ service
-    opts = [CurlUserPwd (user ++ ":" ++ pw), CurlSSLVersion 1 {- TLS -}]
+    opts = [CurlUserPwd (user ++ ":" ++ pw){-, CurlSSLVersion 1 {- TLS -}-}]
 
 parseResults :: FromJSON a => Value -> Parser a
 parseResults (Object o) = o .: "results"
@@ -331,14 +331,14 @@ getMetadata aut warnIfNoMetadata c = do
 
 data Category
   = Popular
-  | NewRelease
+  | Recent
   | Forgotten
   deriving (Eq, Show)
 
 instance Csv.FromField Category where
   parseField = \case
     "Popular" -> pure Popular
-    "NewRelease" -> pure NewRelease
+    "Recent" -> pure Recent
     "Forgotten" -> pure Forgotten
     _ -> mzero
 
@@ -346,13 +346,13 @@ instance Csv.FromField Category where
 data InventoryGame = InventoryGame
   { game :: Game
   , inventory :: !Int
-  , category :: !Category
   , family :: !Bool
   , party :: !Bool
   , abstract :: !Bool
   , strategy :: !Bool
   , player2 :: !Bool
   , player3 :: !Bool
+  , category :: !Category
   } deriving Show
 
 xbool :: Csv.Parser String -> Csv.Parser Bool
@@ -361,16 +361,16 @@ xbool p = p >>= \case "X" -> pure True; "" -> pure False; _ -> mzero
 instance Csv.FromRecord InventoryGame where
   parseRecord v
     | length v == 10 = do
-        game <- Game <$> v .! 0 <*> v .! 1
+        game <- Game <$> v .! 1 <*> v .! 0
         InventoryGame game <$>
           v .! 2 <*>
-          v .! 3 <*>
+          xbool (v .! 3) <*>
           xbool (v .! 4) <*>
           xbool (v .! 5) <*>
           xbool (v .! 6) <*>
           xbool (v .! 7) <*>
           xbool (v .! 8) <*>
-          xbool (v .! 9)
+          v .! 9
     | otherwise =  mzero
 
 readGames :: FilePath -> IO [InventoryGame]
@@ -465,7 +465,7 @@ score :: Prefs -> InventoryGame -> Int
 score prefs game =
   sum $ zipWith aspectScore
   [pPopular, pNewRelease, pForgotten, pFamily, pParty, pAbstract, pStrategy, p2Player, p3Player]
-  [isCategory Popular, isCategory NewRelease, isCategory Forgotten, family, party, abstract, strategy, player2, player3]
+  [isCategory Popular, isCategory Recent, isCategory Forgotten, family, party, abstract, strategy, player2, player3]
   where
     aspectScore f b = let x = f prefs in if b game then x else 4 - x
     isCategory c g = c == category g
@@ -572,8 +572,8 @@ updateUsernameAndCollection aut username customer meta = do
   -- there can be duplicates in the BGG collection
   bgg_collection <- nub <$> getBGGCollection username
   let additional_games = bgg_collection \\ game_collection meta
-  if username == bgg_username meta && null additional_games then do
-    info "Metadata already up-to-date for customer. Skipping."
+  if username == bgg_username meta && null additional_games then
+    --info "Metadata already up-to-date for customer. Skipping."
     pure meta
   else do
     infoCustomer customer "Updating meta data for customer."
@@ -682,7 +682,6 @@ doCommit aut fp = do
   info "Reading shipment CSV file..."
   shipment <- readShipmentFile fp
   mapM_ (updateCollection aut) shipment
-  print shipment
 
 readConfig :: IO Auth
 readConfig = do

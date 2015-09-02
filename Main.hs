@@ -40,7 +40,6 @@ import Text.HTML.TagSoup
 import qualified Control.Logging as Logging
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Lazy.UTF8 as BL.UTF8
-import qualified Data.ByteString.UTF8 as B.UTF8
 import qualified Data.Configurator as Configurator
 import qualified Data.Csv as Csv
 import qualified Data.HashMap.Strict as HashMap
@@ -95,7 +94,7 @@ parseResults _ = mzero
 getResults :: FromJSON a => Value -> IO a
 getResults v =
   case parseEither parseResults v of
-    Left msg -> die ("Failed to get/parse results field: " ++ msg)
+    Left msg -> exit ("Failed to get/parse results field: " <> Text.pack msg)
     Right x -> pure x
 
 -----------------------------------------------------------------------------
@@ -168,7 +167,7 @@ getShippingAddress :: Auth -> Customer -> IO Address
 getShippingAddress aut c = do
   l <- getCustomerAddresses aut (id c)
   case l of
-    []  -> die ("No addresses registered for customer: " ++ show c)
+    []  -> exit ("No addresses registered for customer: " <> Text.pack (show c))
     [a] -> pure a
     a : _ -> do warnCustomer c "more than one address for customer!"; pure a
 
@@ -323,7 +322,7 @@ getMetadata aut warnIfNoMetadata c = do
       pure defaultMetadata
     Just x ->
       case parseMaybe (\case (Object o) -> o .: "data"; _ -> mzero) x of
-        Nothing -> die "Failed to parse customer meta data JSON!"
+        Nothing -> exit "Failed to parse customer meta data JSON!"
         Just meta -> pure meta
 
 -----------------------------------------------------------------------------
@@ -378,7 +377,7 @@ readGames :: FilePath -> IO [InventoryGame]
 readGames fp = do
   bs <- BL.readFile fp
   case Csv.decode Csv.HasHeader bs of
-    Left msg -> die ("CSV parse error: " <> msg)
+    Left msg -> exit ("CSV parse error: " <> Text.pack msg)
     Right v -> pure (Vector.toList v)
 
 -----------------------------------------------------------------------------
@@ -448,7 +447,7 @@ readShipmentFile :: FilePath -> IO [ShipmentRecord]
 readShipmentFile fp = do
   bs <- BL.readFile fp
   case Csv.decodeByName bs of
-    Left msg -> die ("Failed to decode shipment CSV file: " <> msg)
+    Left msg -> exit ("Failed to decode shipment CSV file: " <> Text.pack msg)
     Right (_, v) -> pure $ Vector.toList v
 
 updateCollection :: Auth -> ShipmentRecord -> IO ()
@@ -505,7 +504,7 @@ match games customers =
 -----------------------------------------------------------------------------
 
 forUser :: (Monoid a, IsString a) => a -> a -> a
-forUser username msg = msg <> fromString ", querying collection for user: " <> username
+forUser msg username = msg <> fromString ", querying collection for user: " <> username
 
 extractGame :: Text -> [Tag BL.ByteString] -> IO Game
 extractGame username = \case
@@ -513,7 +512,7 @@ extractGame username = \case
     | Just x <- lookup "objectid" attrs,
       Just gameId <- readMay (BL.UTF8.toString x) ->
         pure Game {gameId, gameTitle = decodeUtf8 $ BL.toStrict name}
-  _ -> die ("Unexpected BGG response" `forUser` Text.unpack username)
+  _ -> exit ("Unexpected BGG response" `forUser` username)
 
 extractGames :: Text -> BL.ByteString -> IO [Game]
 extractGames username body = do
@@ -528,15 +527,15 @@ extractGames username body = do
       msgs <- mapM text $ sections (~== ("<message>" :: String)) ts
       pure (Text.unlines $ map (decodeUtf8 . BL.toStrict) $ catMaybes msgs)
 
-queryBGG :: Customer -> Text -> Int -> IO [Game]
-queryBGG customer username 0 = do warn ("Giving up" `forUser` username); pure []
-queryBGG customer username tries = do
+queryBGG :: Text -> Int -> IO [Game]
+queryBGG username 0 = do warn ("Giving up" `forUser` username); pure []
+queryBGG username tries = do
   log $ "Querying BGG collection for user: " <> username
   x <- try $ Network.Wreq.get url
   case x of
-    Left (HTTP.Client.StatusCodeException (HTTP.Types.Status code msg) _ _) ->
-      let m = "Error from BGG: " <> show code <> " " <> B.UTF8.toString msg in
-      die (m `forUser` Text.unpack username)
+    Left (HTTP.Client.StatusCodeException (HTTP.Types.Status code msg) _ _) -> do
+      let m = "Error from BGG: " <> Text.pack (show code) <> " " <> decodeUtf8 msg
+      exit (m `forUser` username)
     Left HTTP.Client.NoResponseDataReceived -> do
       info ("No response data received from BGG" `forUser` username)
       retry
@@ -563,15 +562,15 @@ queryBGG customer username tries = do
     retry = do
       log "Waiting three seconds before resending request..."
       threadDelay 3000000
-      queryBGG customer username (tries - 1)
+      queryBGG username (tries - 1)
 
-getBGGCollection :: Customer -> Text -> IO [Game]
-getBGGCollection customer username = queryBGG customer username 10
+getBGGCollection :: Text -> IO [Game]
+getBGGCollection username = queryBGG username 10
 
 updateUsernameAndCollection :: Auth -> Text -> Customer -> Metadata -> IO Metadata
 updateUsernameAndCollection aut username customer meta = do
   -- there can be duplicates in the BGG collection
-  bgg_collection <- nub <$> getBGGCollection customer username
+  bgg_collection <- nub <$> getBGGCollection username
   let additional_games = bgg_collection \\ game_collection meta
   if username == bgg_username meta && null additional_games then do
     info "Metadata already up-to-date for customer. Skipping."
@@ -617,6 +616,11 @@ warnCustomer = xxxCustomer warn
 infoCustomer :: Customer -> Text -> IO ()
 infoCustomer = xxxCustomer info
 
+exit :: Text -> IO a
+exit msg = do
+  info ("Fatal error: " <> msg)
+  die "Exiting."
+
 -----------------------------------------------------------------------------
 -- Commands
 -----------------------------------------------------------------------------
@@ -632,7 +636,7 @@ doImport aut fp = do
   info "Reading CSV file..."
   bs <- BL.readFile fp
   case Csv.decode Csv.NoHeader bs of
-    Left msg -> die ("CSV parse error: " <> msg)
+    Left msg -> exit ("CSV parse error: " <> Text.pack msg)
     Right v -> do
       let hashmap = HashMap.fromList (Vector.toList v)
       customers <- getCustomers aut
@@ -668,7 +672,7 @@ doShipment aut fp = do
     writeShipmentFile "shipment.csv" with_addresses
   else
     let customers_without = map fst customers \\ map fst allocated_games in
-    die ("Couldn't find games for all customers! Customers without games: " ++ show customers_without)
+    exit ("Couldn't find games for all customers! Customers without games: " <> Text.pack (show customers_without))
 
 doCommit :: Auth -> FilePath -> IO ()
 doCommit aut fp = do

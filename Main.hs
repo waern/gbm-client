@@ -504,7 +504,7 @@ match games customers =
 -----------------------------------------------------------------------------
 
 forUser :: (Monoid a, IsString a) => a -> a -> a
-forUser msg username = msg <> fromString ", querying collection for user: " <> username
+forUser msg username = msg <> fromString ", when querying collection for user: " <> username
 
 extractGame :: Text -> [Tag BL.ByteString] -> IO Game
 extractGame username = \case
@@ -655,7 +655,9 @@ doRefresh aut = do
   info "Getting metadata..."
   customers_with_meta <- mapM (\c -> (c,) <$> getMetadata aut True c) active_customers
   info "Updating game collections from BGG..."
-  mapM (\(c, m) -> (c,) <$> refreshCollection aut c m) customers_with_meta
+  let actions = map (\(c,m) -> do m' <- refreshCollection aut c m; pure (Just (c, m'))) customers_with_meta
+  let actions' = intersperse (do threadDelay 1000000; pure Nothing) actions
+  catMaybes <$> sequence actions'
 
 doShipment :: Auth -> FilePath -> IO ()
 doShipment aut fp = do

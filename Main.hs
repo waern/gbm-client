@@ -326,7 +326,7 @@ getMetadata aut warnIfNoMetadata c = do
         Just meta -> pure meta
 
 -----------------------------------------------------------------------------
--- Games file
+-- Games file (inventory)
 -----------------------------------------------------------------------------
 
 data Category

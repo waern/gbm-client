@@ -2,7 +2,7 @@ name:                gbm-client
 version:             1.0
 author:              David Waern
 maintainer:          david.waern@gmail.com
-build-type:          Simple
+build-type:          Custom
 cabal-version:       >=1.10
 
 executable gbm-client

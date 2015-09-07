@@ -25,6 +25,7 @@ let env = haskellPackages.ghcWithPackages (p: with p; [
   safe
   network-uri
   ghc-mod
+  cabal-macosx-fork
 ]); in
 pkgs.stdenv.mkDerivation {
   name = "crateman";

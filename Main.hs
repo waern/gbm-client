@@ -24,7 +24,7 @@ import Data.Maybe
 import Data.Monoid
 import Data.Ord
 import Data.Text (Text)
-import Data.Text.Encoding
+import Data.String.Conv
 import GHC.Generics hiding (to)
 import Network.Curl
 import Network.Curl.Aeson
@@ -39,7 +39,6 @@ import System.Exit
 import Text.HTML.TagSoup
 import qualified Control.Logging as Logging
 import qualified Data.ByteString.Lazy as BL
-import qualified Data.ByteString.Lazy.UTF8 as BL.UTF8
 import qualified Data.Configurator as Configurator
 import qualified Data.Csv as Csv
 import qualified Data.HashMap.Strict as HashMap
@@ -167,7 +166,7 @@ getShippingAddress :: Auth -> Customer -> IO Address
 getShippingAddress aut c = do
   l <- getCustomerAddresses aut (id c)
   case l of
-    []  -> exit ("No addresses registered for customer: " <> Text.pack (show c))
+    []  -> exit ("No addresses registered for customer: " <> toS (show c))
     [a] -> pure a
     a : _ -> do warnCustomer c "more than one address for customer!"; pure a
 
@@ -447,7 +446,7 @@ readShipmentFile :: FilePath -> IO [ShipmentRecord]
 readShipmentFile fp = do
   bs <- BL.readFile fp
   case Csv.decodeByName bs of
-    Left msg -> exit ("Failed to decode shipment CSV file: " <> Text.pack msg)
+    Left msg -> exit ("Failed to decode shipment CSV file: " <> toS msg)
     Right (_, v) -> pure $ Vector.toList v
 
 updateCollection :: Auth -> ShipmentRecord -> IO ()
@@ -510,8 +509,7 @@ extractGame :: Text -> [Tag BL.ByteString] -> IO Game
 extractGame username = \case
   (TagOpen "item" attrs : TagText _ : TagOpen "name" _ : TagText name : _)
     | Just x <- lookup "objectid" attrs,
-      Just gameId <- readMay (BL.UTF8.toString x) ->
-        pure Game {gameId, gameTitle = decodeUtf8 $ BL.toStrict name}
+      Just gameId <- readMay (toS x) -> pure Game {gameId, gameTitle = toS name}
   _ -> exit ("Unexpected BGG response" `forUser` username)
 
 extractGames :: Text -> BL.ByteString -> IO [Game]
@@ -523,9 +521,10 @@ extractGames username body = do
   where
     text (_ : TagText str : _) = pure (Just str)
     text _ = do warn ("unexpected XML format" `forUser` username); pure Nothing
+    message :: [Tag BL.ByteString] -> IO Text
     message ts = do
       msgs <- mapM text $ sections (~== ("<message>" :: String)) ts
-      pure (Text.unlines $ map (decodeUtf8 . BL.toStrict) $ catMaybes msgs)
+      pure (Text.unlines $ map toS $ catMaybes msgs)
 
 queryBGG :: Text -> Int -> IO [Game]
 queryBGG username 0 = do warn ("Giving up" `forUser` username); pure []
@@ -534,7 +533,7 @@ queryBGG username tries = do
   x <- try $ Network.Wreq.get url
   case x of
     Left (HTTP.Client.StatusCodeException (HTTP.Types.Status code msg) _ _) -> do
-      let m = "Error from BGG: " <> Text.pack (show code) <> " " <> decodeUtf8 msg
+      let m = "Error from BGG: " <> toS (show code) <> " " <> toS msg
       exit (m `forUser` username)
     Left HTTP.Client.NoResponseDataReceived -> do
       info ("No response data received from BGG" `forUser` username)
@@ -552,12 +551,12 @@ queryBGG username tries = do
         200 ->
           extractGames username (r ^. responseBody)
         _ -> do
-          let msg = Text.pack $ show (r ^. responseStatus)
+          let msg = toS $ show (r ^. responseStatus)
           warn ("BGG API returned error: " <> msg `forUser` username)
           pure []
   where
     -- BGG usernames may, for example, contain spaces
-    escaped_username = escapeURIString isUnescapedInURIComponent (Text.unpack username)
+    escaped_username = escapeURIString isUnescapedInURIComponent (toS username)
     url = "http://www.boardgamegeek.com/xmlapi/collection/" ++ escaped_username ++ "?own=1"
     retry = do
       log "Waiting three seconds before resending request..."
@@ -602,13 +601,13 @@ log :: Text -> IO ()
 log = Logging.log
 
 info :: Text -> IO ()
-info msg = do log msg; putStrLn (Text.unpack msg)
+info msg = do log msg; putStrLn (toS msg)
 
 warn :: Text -> IO ()
-warn msg = do Logging.warn msg; putStrLn ("Warning: " ++ Text.unpack msg)
+warn msg = do Logging.warn msg; putStrLn ("Warning: " ++ toS msg)
 
 xxxCustomer :: (Text -> IO ()) -> Customer -> Text -> IO ()
-xxxCustomer f c msg = f (msg <> " Name: " <> name c <> " ID: " <> Text.pack (show (id c)))
+xxxCustomer f c msg = f (msg <> " Name: " <> name c <> " ID: " <> toS (show (id c)))
 
 warnCustomer :: Customer -> Text -> IO ()
 warnCustomer = xxxCustomer warn
@@ -636,7 +635,7 @@ doImport aut fp = do
   info "Reading CSV file..."
   bs <- BL.readFile fp
   case Csv.decode Csv.NoHeader bs of
-    Left msg -> exit ("CSV parse error: " <> Text.pack msg)
+    Left msg -> exit ("CSV parse error: " <> toS msg)
     Right v -> do
       let hashmap = HashMap.fromList (Vector.toList v)
       customers <- getCustomers aut
@@ -647,11 +646,11 @@ doRefresh :: Auth -> IO [(Customer, Metadata)]
 doRefresh aut = do
   log "Executing refresh command"
   customers <- getCustomers aut
-  info ("Number of customers: " <> Text.pack (show (length customers)))
+  info ("Number of customers: " <> toS (show (length customers)))
   subs <- getSubscriptions aut
   let stmap = HashMap.fromList [(id c, stat) | Subscription c stat <- subs]
   let active_customers = filter (\u -> isActive $ HashMap.lookupDefault "" (id u) stmap) customers
-  info ("Number of active customers: " <> Text.pack (show (length active_customers)))
+  info ("Number of active customers: " <> toS (show (length active_customers)))
   info "Getting metadata..."
   customers_with_meta <- mapM (\c -> (c,) <$> getMetadata aut True c) active_customers
   info "Updating game collections from BGG..."

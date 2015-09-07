@@ -4,6 +4,7 @@
 }:
 #let env = pkgs.haskell.packages.ghcHEAD.ghcWithPackages (p: with p; [
 let env = haskellPackages.ghcWithPackages (p: with p; [
+  string-conv
   http-types
   http-client
   wreq-sb
@@ -18,14 +19,13 @@ let env = haskellPackages.ghcWithPackages (p: with p; [
   text
   lens
   tagsoup
-  utf8-string
   logging
   configurator
   unordered-containers
   safe
   network-uri
   ghc-mod
-  cabal-macosx-fork
+  cabal-macosx
 ]); in
 pkgs.stdenv.mkDerivation {
   name = "crateman";

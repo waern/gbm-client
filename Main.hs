@@ -13,7 +13,6 @@ import Control.Concurrent
 import Control.Exception
 import Control.Lens hiding ((+=), (.=), to)
 import Control.Monad
-import Data.String
 import Data.Aeson
 import Data.Aeson.Types
 import Data.Csv ((.!))
@@ -23,15 +22,14 @@ import Data.List
 import Data.Maybe
 import Data.Monoid
 import Data.Ord
-import Data.Text (Text)
+import Data.String
 import Data.String.Conv
+import Data.Text (Text)
 import GHC.Generics hiding (to)
 import Network.Curl
 import Network.Curl.Aeson
 import Network.URI
 import Network.Wreq hiding (Auth)
-import qualified Network.HTTP.Client as HTTP.Client
-import qualified Network.HTTP.Types as HTTP.Types
 import Prelude hiding (id, log)
 import Safe
 import System.Console.CmdArgs hiding (name)
@@ -44,6 +42,8 @@ import qualified Data.Csv as Csv
 import qualified Data.HashMap.Strict as HashMap
 import qualified Data.Text as Text
 import qualified Data.Vector as Vector
+import qualified Network.HTTP.Client as HTTP.Client
+import qualified Network.HTTP.Types as HTTP.Types
 
 -----------------------------------------------------------------------------
 -- Command line interface
@@ -117,10 +117,8 @@ getCustomers aut = do
 -- Subscriptions
 -----------------------------------------------------------------------------
 
-data Subscription = Subscription
-  { customer :: Customer
-  , status :: Text
-  } deriving (Generic, Show, FromJSON)
+data Subscription = Subscription {customer :: Customer, status :: Text}
+  deriving (Generic, Show, FromJSON)
 
 isActive :: Text -> Bool
 isActive = \case

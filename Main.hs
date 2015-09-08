@@ -605,7 +605,7 @@ warn :: Text -> IO ()
 warn msg = do Logging.warn msg; putStrLn ("Warning: " ++ toS msg)
 
 xxxCustomer :: (Text -> IO ()) -> Customer -> Text -> IO ()
-xxxCustomer f c msg = f (msg <> " Name: " <> name c <> " ID: " <> toS (show (id c)))
+xxxCustomer f c msg = f (msg <> " Name: " <> name c <> ", ID: " <> toS (show (id c)))
 
 warnCustomer :: Customer -> Text -> IO ()
 warnCustomer = xxxCustomer warn

@@ -34,6 +34,7 @@ import Prelude hiding (id, log)
 import Safe
 import System.Console.CmdArgs hiding (name)
 import System.Exit
+import System.IO
 import Text.HTML.TagSoup
 import qualified Control.Logging as Logging
 import qualified Data.ByteString.Lazy as BL
@@ -86,15 +87,26 @@ call (user, pw) meth service = curlAeson parseJSON meth uri opts
     uri = cratejoyApiUrl ++ service
     opts = [CurlUserPwd (user ++ ":" ++ pw){-, CurlSSLVersion 1 {- TLS -}-}]
 
-parseResults :: FromJSON a => Value -> Parser a
-parseResults (Object o) = o .: "results"
-parseResults _ = mzero
+parseCollection :: FromJSON a => Value -> Parser (Maybe String, a)
+parseCollection (Object o) = (,) <$> o .: "next" <*> o .: "results"
+parseCollection _ = mzero
 
-getResults :: FromJSON a => Value -> IO a
-getResults v =
-  case parseEither parseResults v of
-    Left msg -> exit ("Failed to get/parse results field: " <> Text.pack msg)
+getCollection :: FromJSON a => Auth -> String -> IO (Maybe String, [a])
+getCollection aut service = do
+  v <- call aut "GET" service noData
+  case parseEither parseCollection v of
+    Left msg -> exit ("Failed to parse Cratejoy collection object: " <> toS msg)
     Right x -> pure x
+
+getFullCollection :: FromJSON a => Auth -> String -> IO [a]
+getFullCollection aut service = go [] ""
+  where
+    go acc page = do
+      (next, l) <- getCollection aut (service ++ page)
+      let acc' = l ++ acc
+      case next of
+        Nothing -> pure acc'
+        Just s -> do putChar '.'; go acc' s
 
 -----------------------------------------------------------------------------
 -- Customers
@@ -106,12 +118,9 @@ data Customer = Customer {id :: CustomerId, email :: Text, name :: Text}
 instance Csv.ToRecord Customer
 
 getCustomers :: Auth -> IO [Customer]
-getCustomers aut = do
-  info "Fetching customers from Cratejoy..."
-  r <- call aut "GET" "/customers/?limit=100000" noData
-  customers <- getResults r
-  info "Done."
-  pure customers
+getCustomers aut =
+  dots "Fetching customers from Cratejoy..." $
+  getFullCollection aut "/customers/"
 
 -----------------------------------------------------------------------------
 -- Subscriptions
@@ -133,12 +142,9 @@ isActive = \case
   _ -> False
 
 getSubscriptions :: Auth -> IO [Subscription]
-getSubscriptions aut = do
-  info "Fetching subscriptions from Cratejoy..."
-  r <- call aut "GET" "/subscriptions/?limit=100000" noData
-  subscriptions <- getResults r
-  info "Done."
-  pure subscriptions
+getSubscriptions aut =
+  dots "Fetching subscriptions from Cratejoy..." $
+  getFullCollection aut "/subscriptions/"
 
 -----------------------------------------------------------------------------
 -- Addresses
@@ -156,9 +162,8 @@ data Address = Address
   } deriving (Generic, Show, FromJSON)
 
 getCustomerAddresses :: Auth -> CustomerId -> IO [Address]
-getCustomerAddresses aut cid = do
-  r <- call aut "GET" ("/customers/" ++ show cid ++ "/addresses/") noData
-  getResults r
+getCustomerAddresses aut cid =
+  getFullCollection aut ("/customers/" ++ show cid ++ "/addresses/")
 
 getShippingAddress :: Auth -> Customer -> IO Address
 getShippingAddress aut c = do
@@ -618,6 +623,14 @@ exit msg = do
   info ("Fatal error: " <> msg)
   die "Exiting."
 
+dots :: Text -> IO a -> IO a
+dots msg x = do
+  log msg
+  putStr (toS msg)
+  r <- x
+  putChar '\n'
+  pure r
+
 -----------------------------------------------------------------------------
 -- Commands
 -----------------------------------------------------------------------------
@@ -665,8 +678,9 @@ doShipment aut fp = do
   info "Matching and allocating games..."
   let allocated_games = match games customers
   if length allocated_games == length customers then do
-    info "Getting customer addresses..."
-    with_addresses <- mapM (\(u, g) -> do a <- getShippingAddress aut u; pure (u, g, a)) allocated_games
+    with_addresses <-
+      dots "Getting customer addresses..." $
+      mapM (\(u, g) -> do a <- getShippingAddress aut u; pure (u, g, a)) allocated_games
     info "Writing shipment.csv..."
     writeShipmentFile "shipment.csv" with_addresses
   else
@@ -688,12 +702,14 @@ readConfig = do
   pure (username, password)
 
 main :: IO ()
-main = Logging.withFileLogging "log.txt" $ do
-  x <- cmdArgs interface
-  aut <- readConfig
-  case x of
-    Customers -> doCustomers aut
-    Import fp -> doImport aut fp
-    Shipment fp -> doShipment aut fp
-    Commit fp -> doCommit aut fp
-    Refresh -> void $ doRefresh aut
+main = do
+  hSetBuffering stdout NoBuffering
+  Logging.withFileLogging "log.txt" $ do
+    x <- cmdArgs interface
+    aut <- readConfig
+    case x of
+      Customers -> doCustomers aut
+      Import fp -> doImport aut fp
+      Shipment fp -> doShipment aut fp
+      Commit fp -> doCommit aut fp
+      Refresh -> void $ doRefresh aut

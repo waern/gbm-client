@@ -49,7 +49,7 @@ import qualified Network.HTTP.Types as HTTP.Types
 -- Command line interface
 -----------------------------------------------------------------------------
 
-data Crateman
+data CLI
   = Customers
   | Import {users :: FilePath}
   | Shipment {games :: FilePath}
@@ -57,7 +57,7 @@ data Crateman
   | Refresh
   deriving (Show, Data)
 
-interface :: Crateman
+interface :: CLI
 interface = modes [customers, imp, shipment, commit, refresh] &= summary "crateman v1.0"
   where
     customers = Customers &= help "Write customer list to customers.csv"

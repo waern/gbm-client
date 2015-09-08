@@ -28,7 +28,7 @@ let env = haskellPackages.ghcWithPackages (p: with p; [
   cabal-macosx
 ]); in
 pkgs.stdenv.mkDerivation {
-  name = "crateman";
+  name = "gbm-client";
   src = ./.;
   buildInputs = [env];
   shellHook   = ''

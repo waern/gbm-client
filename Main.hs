@@ -659,8 +659,9 @@ doRefresh aut = do
   customers <- getCustomers aut
   info ("Number of customers: " <> toS (show (length customers)))
   subs <- getSubscriptions aut
-  let stmap = HashMap.fromList [(id c, stat) | Subscription c stat <- subs]
-  let active_customers = filter (\u -> isActive $ HashMap.lookupDefault "" (id u) stmap) customers
+  let stmap = HashMap.fromListWith (++) [(id c, [stat]) | Subscription c stat <- subs]
+  let active c = any isActive $ HashMap.lookupDefault [] (id c) stmap
+  let active_customers = filter active customers
   info ("Number of active customers: " <> toS (show (length active_customers)))
   info "Getting metadata..."
   customers_with_meta <- mapM (\c -> (c,) <$> getMetadata aut True c) active_customers

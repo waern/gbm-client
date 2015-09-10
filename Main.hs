@@ -59,7 +59,10 @@ data CLI
   deriving (Show, Data)
 
 interface :: CLI
-interface = modes [customers, imp, shipment, commit, refresh] &= summary "crateman v1.0"
+interface =
+  modes [customers, imp, shipment, commit, refresh]
+  &= summary "crateman v1.0"
+  &= verbosity
   where
     customers = Customers &= help "Write customer list to customers.csv"
     imp = Import {users = def &= argPos 2 &= typFile} &= help "Import BGG user names from CSV file and update collections"
@@ -82,10 +85,11 @@ cratejoyApiUrl :: String
 cratejoyApiUrl = "https://api.cratejoy.com/v1"
 
 call :: (ToJSON a, FromJSON b) => Auth -> String -> String -> Maybe a -> IO b
-call (user, pw) meth service = curlAeson parseJSON meth uri opts
-  where
-    uri = cratejoyApiUrl ++ service
-    opts = [CurlUserPwd (user ++ ":" ++ pw){-, CurlSSLVersion 1 {- TLS -}-}]
+call (user, pw) meth service x = do
+  loud <- isLoud
+  let opts = [CurlVerbose loud, CurlUserPwd (user ++ ":" ++ pw)]
+  let uri = cratejoyApiUrl ++ service
+  curlAeson parseJSON meth uri opts x
 
 parseCollection :: FromJSON a => Value -> Parser (Maybe String, a)
 parseCollection (Object o) = (,) <$> o .: "next" <*> o .: "results"

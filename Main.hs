@@ -46,6 +46,8 @@ import qualified Data.Vector as Vector
 import qualified Network.HTTP.Client as HTTP.Client
 import qualified Network.HTTP.Types as HTTP.Types
 
+import Debug.Trace
+
 -----------------------------------------------------------------------------
 -- Command line interface
 -----------------------------------------------------------------------------
@@ -139,17 +141,19 @@ getCustomers aut =
 data Subscription = Subscription {customer :: Customer, status :: Text}
   deriving (Generic, Show, FromJSON)
 
-isActive :: Text -> Bool
+isActive :: Text -> IO Bool
 isActive = \case
-  "active" -> True
-  "renewing" -> True
-  "unpaid" -> False
-  "cancelled" -> False
-  "suspended" -> False
-  "expired" -> False
-  "pastdue" -> False
-  "pending_renewal" -> False
-  _ -> False
+  "active" -> pure True
+  "renewing" -> pure True
+  "unpaid" -> pure False
+  "unpaid_order_failed" -> pure False
+  "cancelled" -> pure False
+  "suspended" -> pure False
+  "expired" -> pure False
+  "pastdue" -> pure False
+  "past_due" -> pure False
+  "pending_renewal" -> pure False
+  s -> do warn ("unrecognized subscription status: " <> s); pure False
 
 getSubscriptions :: Auth -> IO [Subscription]
 getSubscriptions aut =
@@ -670,8 +674,8 @@ doRefresh aut = do
   info ("Number of customers: " <> toS (show (length customers)))
   subs <- getSubscriptions aut
   let stmap = HashMap.fromListWith (++) [(id c, [stat]) | Subscription c stat <- subs]
-  let active c = any isActive $ HashMap.lookupDefault [] (id c) stmap
-  let active_customers = filter active customers
+  let active c = or <$> mapM isActive (HashMap.lookupDefault [] (id c) stmap)
+  active_customers <- filterM active customers
   info ("Number of active customers: " <> toS (show (length active_customers)))
   info "Getting metadata..."
   customers_with_meta <- mapM (\c -> (c,) <$> getMetadata aut True c) active_customers

@@ -89,7 +89,13 @@ call (user, pw) meth service x = do
   loud <- isLoud
   let opts = [CurlVerbose loud, CurlUserPwd (user ++ ":" ++ pw)]
   let uri = cratejoyApiUrl ++ service
-  curlAeson parseJSON meth uri opts x
+  r <- try $ curlAeson parseJSON meth uri opts x
+  case r of
+    Left (CurlAesonException {curlCode = CurlOperationTimeout}) -> do
+      warn "Calling Cratejoy service took too long (curl timeout). Trying again..."
+      call (user, pw) meth service x
+    Left e -> throwIO e
+    Right y -> pure y
 
 parseCollection :: FromJSON a => Value -> Parser (Maybe String, a)
 parseCollection (Object o) = (,) <$> o .: "next" <*> o .: "results"

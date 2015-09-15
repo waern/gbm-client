@@ -7,7 +7,8 @@ let env = haskellPackages.ghcWithPackages (p: with p; [
   string-conv
   http-types
   http-client
-  wreq-sb
+  #wreq-sb
+  wreq
   aeson
   lens-aeson
   curl
@@ -22,6 +23,7 @@ let env = haskellPackages.ghcWithPackages (p: with p; [
   logging
   configurator
   unordered-containers
+  containers
   safe
   network-uri
   ghc-mod

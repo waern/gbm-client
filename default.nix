@@ -7,12 +7,9 @@ let env = haskellPackages.ghcWithPackages (p: with p; [
   string-conv
   http-types
   http-client
-  #wreq-sb
   wreq
   aeson
   lens-aeson
-  curl
-  curl-aeson
   cassava
   bytestring
   cmdargs
@@ -26,7 +23,6 @@ let env = haskellPackages.ghcWithPackages (p: with p; [
   containers
   safe
   network-uri
-  ghc-mod
   cabal-macosx
 ]); in
 pkgs.stdenv.mkDerivation {

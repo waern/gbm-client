@@ -15,6 +15,7 @@ import Control.Lens hiding ((+=), (.=), to)
 import Control.Monad
 import Data.Aeson
 import Data.Aeson.Types
+import Data.Aeson.Lens
 import Data.Csv ((.!))
 import Data.Function hiding (id)
 import Data.HashMap.Strict (HashMap)
@@ -25,6 +26,7 @@ import Data.Ord
 import Data.String
 import Data.String.Conv
 import Data.Text (Text)
+import qualified Data.Set as Set
 import GHC.Generics hiding (to)
 import Network.Curl
 import Network.Curl.Aeson
@@ -36,6 +38,10 @@ import System.Console.CmdArgs hiding (name)
 import System.Exit
 import System.IO
 import Text.HTML.TagSoup
+--import OpenSSL.Session (context, VerificationMode(..), contextSetVerificationMode)
+--import Network.HTTP.Client.OpenSSL
+import Network.HTTP.Client.TLS
+import Network.Connection
 import qualified Control.Logging as Logging
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.Configurator as Configurator
@@ -88,6 +94,17 @@ cratejoyApiUrl = "https://api.cratejoy.com/v1"
 
 call :: (ToJSON a, FromJSON b) => Auth -> String -> String -> Maybe a -> IO b
 call (user, pw) meth service x = do
+  -- Wreq doesn't work due to HandshakeFailed from tls package
+  {-
+  let opts = Network.Wreq.defaults & Network.Wreq.auth ?~ basicAuth (toS user) (toS pw)
+  r <- Network.Wreq.getWith opts (cratejoyApiUrl ++ service)
+  case r ^? responseBody of
+    Nothing -> exit "No response body"
+    Just body ->
+      case eitherDecode' body of
+        Left msg -> exit (toS msg)
+        Right a -> pure a
+  -}
   loud <- isLoud
   let opts = [CurlVerbose loud, CurlUserPwd (user ++ ":" ++ pw)]
   let uri = cratejoyApiUrl ++ service
@@ -110,15 +127,22 @@ getCollection aut service = do
     Left msg -> exit ("Failed to parse Cratejoy collection object: " <> toS msg)
     Right x -> pure x
 
+{-
 getFullCollection :: FromJSON a => Auth -> String -> IO [a]
-getFullCollection aut service = go [] ""
+getFullCollection aut service = snd <$> getCollection aut (service <> "?limit=10000")
+-}
+
+getFullCollection :: FromJSON a => Auth -> String -> IO [a]
+getFullCollection aut service = go [] 0
   where
-    go acc page = do
-      (next, l) <- getCollection aut (service ++ page)
+    go acc n = do
+      let url = if n == 0 then service else service ++ "&page=" ++ show n
+      print url
+      (next, l) <- getCollection aut url
       let acc' = l ++ acc
       case next of
         Nothing -> pure acc'
-        Just s -> do putChar '.'; go acc' s
+        Just _ -> do putChar '.'; go acc' (n + 1)
 
 -----------------------------------------------------------------------------
 -- Customers
@@ -132,14 +156,22 @@ instance Csv.ToRecord Customer
 getCustomers :: Auth -> IO [Customer]
 getCustomers aut =
   dots "Fetching customers from Cratejoy..." $
-  getFullCollection aut "/customers/"
+  getFullCollection aut "/customers/?order=asc"
 
 -----------------------------------------------------------------------------
 -- Subscriptions
 -----------------------------------------------------------------------------
 
-data Subscription = Subscription {customer :: Customer, status :: Text}
-  deriving (Generic, Show, FromJSON)
+data Subscription = Subscription
+  { subId :: ItemId
+  , customer :: Customer
+  , status :: Text
+  }
+  deriving (Generic, Show)
+
+instance FromJSON Subscription where
+  parseJSON (Object v) = Subscription <$> v .: "id" <*> v .: "customer" <*> v .: "status"
+  parseJSON _ = mzero
 
 isActive :: Text -> IO Bool
 isActive = \case
@@ -158,7 +190,7 @@ isActive = \case
 getSubscriptions :: Auth -> IO [Subscription]
 getSubscriptions aut =
   dots "Fetching subscriptions from Cratejoy..." $
-  getFullCollection aut "/subscriptions/"
+  getFullCollection aut "/subscriptions/?order=asc"
 
 -----------------------------------------------------------------------------
 -- Addresses
@@ -186,6 +218,31 @@ getShippingAddress aut c = do
     []  -> exit ("No addresses registered for customer: " <> toS (show c))
     [a] -> pure a
     a : _ -> do warnCustomer c "more than one address for customer!"; pure a
+
+-----------------------------------------------------------------------------
+-- Shipments
+-----------------------------------------------------------------------------
+
+data Fulfillment = Fulfillment
+  { cycle_number :: Int
+  }
+  deriving (Generic, Show, FromJSON)
+
+data Ship = Ship
+  { shipId :: ItemId
+  , shipCustomer :: Customer
+  , shipFulfillments :: [Fulfillment]
+  , shipStatus :: Text
+  }
+  deriving (Generic, Show)
+
+instance FromJSON Ship where
+  parseJSON (Object v) =
+    Ship <$> v .: "id" <*> v .: "customer" <*> v .: "fulfillments" <*> v .: "status"
+  parseJSON _ = mzero
+
+getShipments :: Auth -> IO [Ship]
+getShipments aut = getFullCollection aut "/shipments/"
 
 -----------------------------------------------------------------------------
 -- Preferences
@@ -316,13 +373,6 @@ getCustomerMetadata aut cid = do
     Left (CurlAesonException {curlCode = CurlHttpReturnedError}) -> pure Nothing -- interpret as 404
     Left e -> do warn "unexpected exception using customer meta data end point"; throwIO e
     Right x -> pure x
-  {-
-    Wreq doesn't work due to HandshakeFailed from tls package (bug?)
-    let opts = Network.Wreq.defaults & Network.Wreq.auth ?~ basicAuth (ByteString.Char8.pack user) (ByteString.Char8.pack pw)
-    r <- Network.Wreq.getWith opts (cratejoyApiUrl ++ "/customers/" ++ show cid ++ "/metadata/")
-    let results = r ^? responseBody . Data.Aeson.Lens.key "results"
-    pure results
-  -}
 
 postCustomerMetadata :: ToJSON a => Auth -> CustomerId -> a -> IO ()
 postCustomerMetadata aut cid x =
@@ -395,6 +445,21 @@ readGames fp = do
   case Csv.decode Csv.HasHeader bs of
     Left msg -> exit ("CSV parse error: " <> Text.pack msg)
     Right v -> pure (Vector.toList v)
+
+-----------------------------------------------------------------------------
+-- Cratejoy subscription export
+-----------------------------------------------------------------------------
+
+data SubscriptionExport = SubscriptionExport
+  { expId :: Int
+  , expStatus :: String }
+  deriving Show
+
+instance Csv.FromNamedRecord SubscriptionExport where
+  parseNamedRecord m = do
+    id <- Csv.lookup m "id"
+    status <- Csv.lookup m "status"
+    pure (SubscriptionExport id status)
 
 -----------------------------------------------------------------------------
 -- Shipment file
@@ -673,7 +738,10 @@ doRefresh aut = do
   customers <- getCustomers aut
   info ("Number of customers: " <> toS (show (length customers)))
   subs <- getSubscriptions aut
-  let stmap = HashMap.fromListWith (++) [(id c, [stat]) | Subscription c stat <- subs]
+  info ("Number of subscriptions: " <> toS (show (length subs)))
+  nb_active_subs <- length <$> filterM (\x -> isActive (status x)) subs
+  info ("Number of active subscriptions: " <> toS (show nb_active_subs))
+  let stmap = HashMap.fromListWith (++) [(id c, [stat]) | Subscription _ c stat <- subs]
   let active c = or <$> mapM isActive (HashMap.lookupDefault [] (id c) stmap)
   active_customers <- filterM active customers
   info ("Number of active customers: " <> toS (show (length active_customers)))

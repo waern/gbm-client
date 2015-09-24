@@ -14,7 +14,7 @@ import Control.Exception
 import Control.Lens hiding ((+=), (.=), to)
 import Control.Monad
 import Data.Aeson
-import Data.Aeson.Types
+import Data.Aeson.Lens
 import Data.Csv ((.!))
 import Data.Function hiding (id)
 import Data.HashMap.Strict (HashMap)
@@ -26,10 +26,9 @@ import Data.String
 import Data.String.Conv
 import Data.Text (Text)
 import GHC.Generics hiding (to)
-import Network.Curl
-import Network.Curl.Aeson
 import Network.URI
-import Network.Wreq hiding (Auth)
+import Network.HTTP.Client
+import Network.HTTP.Types.Status
 import Prelude hiding (id, log)
 import Safe
 import System.Console.CmdArgs hiding (name)
@@ -45,6 +44,8 @@ import qualified Data.Text as Text
 import qualified Data.Vector as Vector
 import qualified Network.HTTP.Client as HTTP.Client
 import qualified Network.HTTP.Types as HTTP.Types
+import qualified Network.Wreq as Wreq
+import qualified Network.Wreq.Session as Wreq.Session
 
 import Debug.Trace
 
@@ -77,6 +78,8 @@ interface =
 -----------------------------------------------------------------------------
 
 type Auth = (String, String)
+type Env = (Auth, Wreq.Session.Session)
+
 type ItemId = Int
 type CustomerId = ItemId
 
@@ -86,35 +89,36 @@ type CustomerId = ItemId
 cratejoyApiUrl :: String
 cratejoyApiUrl = "https://api.cratejoy.com/v1"
 
-call :: (ToJSON a, FromJSON b) => Auth -> String -> String -> Maybe a -> IO b
-call (user, pw) meth service x = do
-  loud <- isLoud
-  let opts = [CurlVerbose loud, CurlUserPwd (user ++ ":" ++ pw)]
+opts :: Auth -> Wreq.Options
+opts (user, pw) =
+  Wreq.defaults & Wreq.auth ?~ Wreq.basicAuth (toS user) (toS pw)
+
+post :: ToJSON a => Env -> String -> a -> IO ()
+post (aut, sess) service x = do
   let uri = cratejoyApiUrl ++ service
-  r <- try $ curlAeson parseJSON meth uri opts x
-  case r of
-    Left (CurlAesonException {curlCode = CurlOperationTimeout}) -> do
-      warn "Calling Cratejoy service took too long (curl timeout). Trying again..."
-      call (user, pw) meth service x
-    Left e -> throwIO e
-    Right y -> pure y
+  void $ Wreq.Session.postWith (opts aut) sess uri (encode x)
 
-parseCollection :: FromJSON a => Value -> Parser (Maybe String, a)
-parseCollection (Object o) = (,) <$> o .: "next" <*> o .: "results"
-parseCollection _ = mzero
+get :: Env -> String -> IO (Wreq.Response BL.ByteString)
+get (aut, sess) service = do
+  let uri = cratejoyApiUrl ++ service
+  Wreq.Session.getWith (opts aut) sess uri
 
-getCollection :: FromJSON a => Auth -> String -> IO (Maybe String, [a])
-getCollection aut service = do
-  v <- call aut "GET" service noData
-  case parseEither parseCollection v of
-    Left msg -> exit ("Failed to parse Cratejoy collection object: " <> toS msg)
-    Right x -> pure x
+getCollection :: (FromJSON a, ToJSON a) => Env -> String -> IO (Maybe String, [a])
+getCollection env service = do
+  r <- get env service
+  let next = r ^? Wreq.responseBody . key "next" . nonNull . _String
+  let results = r ^? Wreq.responseBody . key "results" . _JSON
+  results' <-
+    case results of
+      Nothing -> exit "failed to parse Cratejoy collection"
+      Just rs -> pure rs
+  pure (toS <$> next, results')
 
-getFullCollection :: FromJSON a => Auth -> String -> IO [a]
-getFullCollection aut service = go [] ""
+getFullCollection :: (FromJSON a, ToJSON a) => Env -> String -> IO [a]
+getFullCollection env service = go [] ""
   where
     go acc page = do
-      (next, l) <- getCollection aut (service ++ page)
+      (next, l) <- getCollection env (service ++ page)
       let acc' = l ++ acc
       case next of
         Nothing -> pure acc'
@@ -125,21 +129,21 @@ getFullCollection aut service = go [] ""
 -----------------------------------------------------------------------------
 
 data Customer = Customer {id :: CustomerId, email :: Text, name :: Text}
-  deriving (Eq, Show, Generic, FromJSON)
+  deriving (Eq, Show, Generic, FromJSON, ToJSON)
 
 instance Csv.ToRecord Customer
 
-getCustomers :: Auth -> IO [Customer]
-getCustomers aut =
+getCustomers :: Env -> IO [Customer]
+getCustomers env =
   dots "Fetching customers from Cratejoy..." $
-  getFullCollection aut "/customers/"
+  getFullCollection env "/customers/"
 
 -----------------------------------------------------------------------------
 -- Subscriptions
 -----------------------------------------------------------------------------
 
 data Subscription = Subscription {customer :: Customer, status :: Text}
-  deriving (Generic, Show, FromJSON)
+  deriving (Generic, Show, FromJSON, ToJSON)
 
 isActive :: Text -> IO Bool
 isActive = \case
@@ -155,10 +159,10 @@ isActive = \case
   "pending_renewal" -> pure False
   s -> do warn ("unrecognized subscription status: " <> s); pure False
 
-getSubscriptions :: Auth -> IO [Subscription]
-getSubscriptions aut =
+getSubscriptions :: Env -> IO [Subscription]
+getSubscriptions env =
   dots "Fetching subscriptions from Cratejoy..." $
-  getFullCollection aut "/subscriptions/"
+  getFullCollection env "/subscriptions/"
 
 -----------------------------------------------------------------------------
 -- Addresses
@@ -173,15 +177,15 @@ data Address = Address
   , zip_code :: Text
   , state :: Text
   , country :: Text
-  } deriving (Generic, Show, FromJSON)
+  } deriving (Generic, Show, FromJSON, ToJSON)
 
-getCustomerAddresses :: Auth -> CustomerId -> IO [Address]
-getCustomerAddresses aut cid =
-  getFullCollection aut ("/customers/" ++ show cid ++ "/addresses/")
+getCustomerAddresses :: Env -> CustomerId -> IO [Address]
+getCustomerAddresses env cid =
+  getFullCollection env ("/customers/" ++ show cid ++ "/addresses/")
 
-getShippingAddress :: Auth -> Customer -> IO Address
-getShippingAddress aut c = do
-  l <- getCustomerAddresses aut (id c)
+getShippingAddress :: Env -> Customer -> IO Address
+getShippingAddress env c = do
+  l <- getCustomerAddresses env (id c)
   case l of
     []  -> exit ("No addresses registered for customer: " <> toS (show c))
     [a] -> pure a
@@ -308,38 +312,23 @@ addGames games meta =
   let collection = nub $ game_collection meta ++ games in
   meta {game_collection = collection, wishlist = wishlist meta \\ collection}
 
-getCustomerMetadata :: Auth -> CustomerId -> IO (Maybe Value)
-getCustomerMetadata aut cid = do
-  r <- try $ call aut "GET" ("/customers/" ++ show cid ++ "/metadata/") noData
-  case r of
-    -- XXX: we should distinguish 404 from other errors here
-    Left (CurlAesonException {curlCode = CurlHttpReturnedError}) -> pure Nothing -- interpret as 404
-    Left e -> do warn "unexpected exception using customer meta data end point"; throwIO e
-    Right x -> pure x
-  {-
-    Wreq doesn't work due to HandshakeFailed from tls package (bug?)
-    let opts = Network.Wreq.defaults & Network.Wreq.auth ?~ basicAuth (ByteString.Char8.pack user) (ByteString.Char8.pack pw)
-    r <- Network.Wreq.getWith opts (cratejoyApiUrl ++ "/customers/" ++ show cid ++ "/metadata/")
-    let results = r ^? responseBody . Data.Aeson.Lens.key "results"
-    pure results
-  -}
-
-postCustomerMetadata :: ToJSON a => Auth -> CustomerId -> a -> IO ()
-postCustomerMetadata aut cid x =
-  call aut "POST" ("/customers/" ++ show cid ++ "/metadata/") (Just x)
-
--- | Given a customer, get its metadata from Cratejoy
-getMetadata :: Auth -> Bool -> Customer -> IO Metadata
-getMetadata aut warnIfNoMetadata c = do
-  r <- getCustomerMetadata aut (id c)
-  case r of
-    Nothing -> do
-      when warnIfNoMetadata $ warnCustomer c "no metadata for customer!"
-      pure defaultMetadata
-    Just x ->
-      case parseMaybe (\case (Object o) -> o .: "data"; _ -> mzero) x of
-        Nothing -> exit "Failed to parse customer meta data JSON!"
+getCustomerMetadata :: Env -> Bool -> Customer -> IO Metadata
+getCustomerMetadata env warnIfNoMetadata cust = do
+  x <- try $ get env ("/customers/" ++ show (id cust) ++ "/metadata/")
+  case x of
+    Left (StatusCodeException s _ _)
+      | s ^. Wreq.statusCode == 404 -> do
+         when warnIfNoMetadata $ warnCustomer cust "no metadata for customer!"
+         pure defaultMetadata
+    Left e -> throwIO e
+    Right r ->
+      case r ^? Wreq.responseBody . key "data" . _JSON of
+        Nothing -> exit "failed to parse customer meta data response"
         Just meta -> pure meta
+
+postCustomerMetadata :: ToJSON a => Env -> CustomerId -> a -> IO ()
+postCustomerMetadata env cid x =
+  post env ("/customers/" ++ show cid ++ "/metadata/") x
 
 -----------------------------------------------------------------------------
 -- Games file (inventory)
@@ -466,12 +455,12 @@ readShipmentFile fp = do
     Left msg -> exit ("Failed to decode shipment CSV file: " <> toS msg)
     Right (_, v) -> pure $ Vector.toList v
 
-updateCollection :: Auth -> ShipmentRecord -> IO ()
-updateCollection aut (ShipmentRecord customer _ game) = do
+updateCollection :: Env -> ShipmentRecord -> IO ()
+updateCollection env (ShipmentRecord customer _ game) = do
   -- XXX: race condition
-  meta <- getMetadata aut True customer
+  meta <- getCustomerMetadata env True customer
   let meta' = addGames [game] meta
-  postCustomerMetadata aut (id customer) meta'
+  postCustomerMetadata env (id customer) meta'
 
 -----------------------------------------------------------------------------
 -- Matching algorithm
@@ -547,7 +536,7 @@ queryBGG :: Text -> Int -> IO [Game]
 queryBGG username 0 = do warn ("Giving up" `forUser` username); pure []
 queryBGG username tries = do
   log $ "Querying BGG collection for user: " <> username
-  x <- try $ Network.Wreq.get url
+  x <- try $ Wreq.get url
   case x of
     Left (HTTP.Client.StatusCodeException (HTTP.Types.Status code msg) _ _) -> do
       let m = "Error from BGG: " <> toS (show code) <> " " <> toS msg
@@ -561,16 +550,16 @@ queryBGG username tries = do
     Left e ->
       throwIO e
     Right r ->
-      case r ^. responseStatus . statusCode of
-        202 -> do
-          log ("Access to BGG game collection accepted" `forUser` username)
-          retry
-        200 ->
-          extractGames username (r ^. responseBody)
-        _ -> do
-          let msg = toS $ show (r ^. responseStatus)
-          warn ("BGG API returned error: " <> msg `forUser` username)
-          pure []
+      case r ^. Wreq.responseStatus of
+        st | st == status202 -> do
+              log ("Access to BGG game collection accepted" `forUser` username)
+              retry
+           | st == ok200 ->
+              extractGames username (r ^. Wreq.responseBody)
+           | otherwise -> do
+              let msg = toS $ show (r ^. Wreq.responseStatus)
+              warn ("BGG API returned error: " <> msg `forUser` username)
+              pure []
   where
     -- BGG usernames may, for example, contain spaces
     escaped_username = escapeURIString isUnescapedInURIComponent (toS username)
@@ -583,8 +572,8 @@ queryBGG username tries = do
 getBGGCollection :: Text -> IO [Game]
 getBGGCollection username = queryBGG username 10
 
-updateUsernameAndCollection :: Auth -> Text -> Customer -> Metadata -> IO Metadata
-updateUsernameAndCollection aut username customer meta = do
+updateUsernameAndCollection :: Env -> Text -> Customer -> Metadata -> IO Metadata
+updateUsernameAndCollection env username customer meta = do
   -- there can be duplicates in the BGG collection
   bgg_collection <- nub <$> getBGGCollection username
   let additional_games = bgg_collection \\ game_collection meta
@@ -594,20 +583,20 @@ updateUsernameAndCollection aut username customer meta = do
   else do
     infoCustomer customer "Updating meta data for customer."
     let meta' = addGames additional_games meta {bgg_username = username}
-    postCustomerMetadata aut (id customer) meta'
+    postCustomerMetadata env (id customer) meta'
     pure meta'
 
-refreshCollection :: Auth -> Customer -> Metadata -> IO Metadata
-refreshCollection aut customer meta = do
+refreshCollection :: Env -> Customer -> Metadata -> IO Metadata
+refreshCollection env customer meta = do
   let username = bgg_username meta
   if username == "" then pure meta else
-    updateUsernameAndCollection aut username customer meta
+    updateUsernameAndCollection env username customer meta
 
-importUsernameAndCollection :: Auth -> HashMap Text Text -> Customer -> IO ()
-importUsernameAndCollection aut hashmap customer = do
-  meta <- getMetadata aut False customer
+importUsernameAndCollection :: Env -> HashMap Text Text -> Customer -> IO ()
+importUsernameAndCollection env hashmap customer = do
+  meta <- getCustomerMetadata env False customer
   case HashMap.lookup (name customer) hashmap of
-    Just username | username /= "" -> void $ updateUsernameAndCollection aut username customer meta
+    Just username | username /= "" -> void $ updateUsernameAndCollection env username customer meta
     _ -> return () --info "No BGG username in CSV file, skipping customer."
 
 -----------------------------------------------------------------------------
@@ -649,13 +638,13 @@ dots msg x = do
 -- Commands
 -----------------------------------------------------------------------------
 
-doCustomers :: Auth -> IO ()
-doCustomers aut = do
-  customers <- getCustomers aut
+doCustomers :: Env -> IO ()
+doCustomers env = do
+  customers <- getCustomers env
   BL.writeFile "customers.csv" (Csv.encode customers)
 
-doImport :: Auth -> FilePath -> IO ()
-doImport aut fp = do
+doImport :: Env -> FilePath -> IO ()
+doImport env fp = do
   log "Executing import command"
   info "Reading CSV file..."
   bs <- BL.readFile fp
@@ -663,51 +652,51 @@ doImport aut fp = do
     Left msg -> exit ("CSV parse error: " <> toS msg)
     Right v -> do
       let hashmap = HashMap.fromList (Vector.toList v)
-      customers <- getCustomers aut
+      customers <- getCustomers env
       info "Uploading BGG usernames and collections to Cratejoy..."
-      mapM_ (importUsernameAndCollection aut hashmap) customers
+      mapM_ (importUsernameAndCollection env hashmap) customers
 
-doRefresh :: Auth -> IO [(Customer, Metadata)]
-doRefresh aut = do
+doRefresh :: Env -> IO [(Customer, Metadata)]
+doRefresh env = do
   log "Executing refresh command"
-  customers <- getCustomers aut
+  customers <- getCustomers env
   info ("Number of customers: " <> toS (show (length customers)))
-  subs <- getSubscriptions aut
+  subs <- getSubscriptions env
   let stmap = HashMap.fromListWith (++) [(id c, [stat]) | Subscription c stat <- subs]
   let active c = or <$> mapM isActive (HashMap.lookupDefault [] (id c) stmap)
   active_customers <- filterM active customers
   info ("Number of active customers: " <> toS (show (length active_customers)))
   info "Getting metadata..."
-  customers_with_meta <- mapM (\c -> (c,) <$> getMetadata aut True c) active_customers
+  customers_with_meta <- mapM (\c -> (c,) <$> getCustomerMetadata env True c) active_customers
   info "Updating game collections from BGG..."
-  let actions = map (\(c,m) -> do m' <- refreshCollection aut c m; pure (Just (c, m'))) customers_with_meta
+  let actions = map (\(c,m) -> do m' <- refreshCollection env c m; pure (Just (c, m'))) customers_with_meta
   let actions' = intersperse (do threadDelay 1000000; pure Nothing) actions
   catMaybes <$> sequence actions'
 
-doShipment :: Auth -> FilePath -> IO ()
-doShipment aut fp = do
+doShipment :: Env -> FilePath -> IO ()
+doShipment env fp = do
   log "Executing shipment command"
   info "Reading games CSV file..."
   games <- readGames fp
-  customers <- doRefresh aut
+  customers <- doRefresh env
   info "Matching and allocating games..."
   let allocated_games = match games customers
   if length allocated_games == length customers then do
     with_addresses <-
       dots "Getting customer addresses..." $
-      mapM (\(u, g) -> do a <- getShippingAddress aut u; pure (u, g, a)) allocated_games
+      mapM (\(u, g) -> do a <- getShippingAddress env u; pure (u, g, a)) allocated_games
     info "Writing shipment.csv..."
     writeShipmentFile "shipment.csv" with_addresses
   else
     let customers_without = map fst customers \\ map fst allocated_games in
     exit ("Couldn't find games for all customers! Customers without games: " <> Text.pack (show customers_without))
 
-doCommit :: Auth -> FilePath -> IO ()
-doCommit aut fp = do
+doCommit :: Env -> FilePath -> IO ()
+doCommit env fp = do
   log "Executing commit command"
   info "Reading shipment CSV file..."
   shipment <- readShipmentFile fp
-  mapM_ (updateCollection aut) shipment
+  mapM_ (updateCollection env) shipment
 
 readConfig :: IO Auth
 readConfig = do
@@ -722,9 +711,11 @@ main = do
   Logging.withFileLogging "log.txt" $ do
     x <- cmdArgs interface
     aut <- readConfig
-    case x of
-      Customers -> doCustomers aut
-      Import fp -> doImport aut fp
-      Shipment fp -> doShipment aut fp
-      Commit fp -> doCommit aut fp
-      Refresh -> void $ doRefresh aut
+    Wreq.Session.withSession $ \sess ->
+      let env = (aut, sess) in
+      case x of
+        Customers -> doCustomers env
+        Import fp -> doImport env fp
+        Shipment fp -> doShipment env fp
+        Commit fp -> doCommit env fp
+        Refresh -> void $ doRefresh env

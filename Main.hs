@@ -24,7 +24,11 @@ import Data.Monoid
 import Data.Ord
 import Data.String
 import Data.String.Conv
+import Data.Scientific
 import Data.Text (Text)
+import Data.Time
+import Data.Time.Format
+import Data.Time.Clock.POSIX
 import GHC.Generics hiding (to)
 import Network.URI
 import Network.HTTP.Client
@@ -54,7 +58,7 @@ import qualified Network.Wreq.Session as Wreq.Session
 data CLI
   = Customers
   | Import {users :: FilePath}
-  | Shipment {games :: FilePath}
+  | Shipment {games :: FilePath, t1 :: String, t2 :: String}
   | Commit {shipment :: FilePath}
   | Refresh
   deriving (Show, Data)
@@ -67,7 +71,7 @@ interface =
   where
     customers = Customers &= help "Write customer list to customers.csv"
     imp = Import {users = def &= argPos 2 &= typFile} &= help "Import BGG user names from CSV file and update collections"
-    shipment = Shipment {games = def &= argPos 0 &= typFile} &= help "Make shipment.csv, taking game inventory CSV file as input"
+    shipment = Shipment {games = def &= argPos 0 &= typFile, t1 = def &= argPos 2, t2 = def &= argPos 3} &= help "Make shipment.csv, taking game inventory CSV file as input"
     commit = Commit {shipment = def &= argPos 1 &= typFile} &= help "Commit shipment information, taking a shipment CSV file as input"
     refresh = Refresh &= help "Refresh game collections from boardgamegeek.com"
 
@@ -128,7 +132,7 @@ getFullCollection env service = go [] 0
 -----------------------------------------------------------------------------
 
 data Customer = Customer {id :: CustomerId, email :: Text, name :: Text}
-  deriving (Eq, Show, Generic, FromJSON, ToJSON)
+  deriving (Ord, Eq, Show, Generic, FromJSON, ToJSON)
 
 instance Csv.ToRecord Customer
 
@@ -202,26 +206,59 @@ getShippingAddress env c = do
 -- Shipments
 -----------------------------------------------------------------------------
 
-data Fulfillment = Fulfillment
-  { cycle_number :: Int
-  }
-  deriving (Generic, Show, FromJSON, ToJSON)
+newtype CratejoyDateTime = CratejoyDateTime UTCTime
+  deriving (Generic, Ord, Eq, Show, ToJSON)
+
+instance FromJSON CratejoyDateTime where
+  parseJSON (Number n) =
+    case floatingOrInteger n of
+      Left _ -> error "Unexpected date format"
+      Right i -> pure . CratejoyDateTime . posixSecondsToUTCTime . fromInteger . (`div` 1000) . toInteger $ i
+  parseJSON _ = mzero
 
 data Ship = Ship
-  { shipId :: ItemId
+  { shipAdjustedOrderedAt :: CratejoyDateTime
+  , shipId :: ItemId
   , shipCustomer :: Customer
-  , shipFulfillments :: [Fulfillment]
   , shipStatus :: Text
   }
-  deriving (Generic, Show, ToJSON)
+  deriving (Generic, Ord, Eq, Show, ToJSON)
 
 instance FromJSON Ship where
   parseJSON (Object v) =
-    Ship <$> v .: "id" <*> v .: "customer" <*> v .: "fulfillments" <*> v .: "status"
+    Ship <$> v .: "adjusted_ordered_at" <*> v .: "id" <*> v .: "customer" <*> {-v .: "fulfillments" <*>-} v .: "status"
   parseJSON _ = mzero
 
-getShipments :: Env -> IO [Ship]
-getShipments env = getFullCollection env "/shipments/"
+getShipmentsOn :: Env -> Day -> IO [Ship]
+getShipmentsOn env d = do
+  let f day = formatTime defaultTimeLocale (iso8601DateFormat Nothing) (UTCTime day 0)
+  let pad = \case [c] -> '0':[c]; s -> s
+  let times = ["T" ++ pad (show h) ++ ":00:00Z" | h <- [0..23]]
+  let call d1 t1 d2 t2 = do
+        let s1 = f d1 ++ t1
+        let s2 = f d2 ++ t2
+        let query = "adjusted_ordered_at__ge=" ++ s1 ++ "&adjusted_ordered_at__lt=" ++ s2
+        snd <$> getCollection env ("/shipments/?limit=300&" ++ query)
+  let
+    go [t] = [call d t (addDays 1 d) "T00:00:00Z"]
+    go (t1:t2:ts) = call d t1 d t2 : go (t2 : ts)
+  concat <$> sequence (go times)
+
+daysBetween :: Day -> Day -> [Day]
+daysBetween d1 d2 =
+  let d1' = min d1 d2 in
+  let d2' = max d1 d2 in
+  go d1' d2'
+  where
+    go a b
+      | a < b = a : daysBetween (addDays 1 a) b
+      | otherwise = [a]
+
+getShipments :: Env -> Day -> Day -> IO [Ship]
+getShipments env d1 d2 = do
+  info "Fetching shipments from Cratejoy..."
+  let days = daysBetween d1 d2
+  concat <$> mapM (getShipmentsOn env) days
 
 -----------------------------------------------------------------------------
 -- Preferences
@@ -723,11 +760,22 @@ doRefresh env = do
   let actions' = intersperse (do threadDelay 1000000; pure Nothing) actions
   catMaybes <$> sequence actions'
 
-doShipment :: Env -> FilePath -> IO ()
-doShipment env fp = do
+doShipment :: Env -> FilePath -> String -> String -> IO ()
+doShipment env fp t1 t2 = do
   log "Executing shipment command"
+  let f = utctDay . parseTimeOrError True defaultTimeLocale (iso8601DateFormat Nothing)
+  let d1 = f t1
+  let d2 = f t2
   info "Reading games CSV file..."
   games <- readGames fp
+  shipments <- getShipments env d1 d2
+  let shipments' = sort shipments
+  mapM_ (\Ship {shipAdjustedOrderedAt = CratejoyDateTime utc, shipStatus, shipCustomer} ->
+    let s = toS $ formatTime defaultTimeLocale (iso8601DateFormat Nothing) utc in
+    putStrLn (toS (s <> " " <> shipStatus <> " " <> name shipCustomer))
+    ) shipments'
+  info ("Number of shipments: " <> toS (show (length shipments)))
+  {-
   customers <- doRefresh env
   info "Matching and allocating games..."
   let allocated_games = match games customers
@@ -740,6 +788,7 @@ doShipment env fp = do
   else
     let customers_without = map fst customers \\ map fst allocated_games in
     exit ("Couldn't find games for all customers! Customers without games: " <> Text.pack (show customers_without))
+    -}
 
 doCommit :: Env -> FilePath -> IO ()
 doCommit env fp = do
@@ -766,6 +815,6 @@ main = do
       case x of
         Customers -> doCustomers env
         Import fp -> doImport env fp
-        Shipment fp -> doShipment env fp
+        Shipment fp t1 t2 -> doShipment env fp t1 t2
         Commit fp -> doCommit env fp
         Refresh -> void $ doRefresh env

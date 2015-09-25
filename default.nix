@@ -23,6 +23,8 @@ let env = haskellPackages.ghcWithPackages (p: with p; [
   containers
   safe
   network-uri
+  time
+  scientific
   cabal-macosx
 ]); in
 pkgs.stdenv.mkDerivation {

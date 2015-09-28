@@ -188,12 +188,13 @@ data Address = Address
   , zip_code :: Text
   , state :: Text
   , country :: Text
-  } deriving (Generic, Show, FromJSON, ToJSON)
+  } deriving (Generic, Ord, Eq, Show, FromJSON, ToJSON)
 
 getCustomerAddresses :: Env -> CustomerId -> IO [Address]
 getCustomerAddresses env cid =
   getFullCollection env ("/customers/" ++ show cid ++ "/addresses/")
 
+{-
 getShippingAddress :: Env -> Customer -> IO Address
 getShippingAddress env c = do
   l <- getCustomerAddresses env (id c)
@@ -201,6 +202,7 @@ getShippingAddress env c = do
     []  -> exit ("No addresses registered for customer: " <> toS (show c))
     [a] -> pure a
     a : _ -> do warnCustomer c "more than one address for customer!"; pure a
+-}
 
 -----------------------------------------------------------------------------
 -- Shipments
@@ -209,11 +211,24 @@ getShippingAddress env c = do
 newtype CratejoyDateTime = CratejoyDateTime UTCTime
   deriving (Generic, Ord, Eq, Show, ToJSON)
 
+msSinceEpochToUtc :: Int -> UTCTime
+msSinceEpochToUtc = posixSecondsToUTCTime . fromInteger . (`div` 1000) . toInteger
+
 instance FromJSON CratejoyDateTime where
   parseJSON (Number n) =
     case floatingOrInteger n of
       Left _ -> error "Unexpected date format"
-      Right i -> pure . CratejoyDateTime . posixSecondsToUTCTime . fromInteger . (`div` 1000) . toInteger $ i
+      Right i -> pure . CratejoyDateTime . msSinceEpochToUtc $ i
+  parseJSON _ = mzero
+
+data Instance = Instance {product_id :: ItemId}
+  deriving (Generic, Ord, Eq, Show, ToJSON, FromJSON)
+
+data Fulfillment = Fulfillment {fulInstance :: Instance}
+  deriving (Generic, Ord, Eq, Show, ToJSON)
+
+instance FromJSON Fulfillment where
+  parseJSON (Object v) = Fulfillment <$> v .: "instance"
   parseJSON _ = mzero
 
 data Ship = Ship
@@ -221,26 +236,42 @@ data Ship = Ship
   , shipId :: ItemId
   , shipCustomer :: Customer
   , shipStatus :: Text
+  , shipIsTest :: Bool
+  , shipAddress :: Address
+  , shipFulfillments :: [Fulfillment]
   }
-  deriving (Generic, Ord, Eq, Show, ToJSON)
+  deriving (Generic, Ord, Show, ToJSON)
+
+instance Eq Ship where
+  (==) = (==) `on` shipId
 
 instance FromJSON Ship where
   parseJSON (Object v) =
-    Ship <$> v .: "adjusted_ordered_at" <*> v .: "id" <*> v .: "customer" <*> {-v .: "fulfillments" <*>-} v .: "status"
+    Ship <$>
+      v .: "adjusted_ordered_at" <*>
+      v .: "id" <*> v .: "customer" <*>
+      v .: "status" <*>
+      v .: "is_test" <*>
+      v .: "ship_address" <*>
+      v .: "fulfillments"
   parseJSON _ = mzero
 
-getShipmentsOn :: Env -> Day -> IO [Ship]
-getShipmentsOn env d = do
+data X = Full | Morning | Evening
+
+getShipmentsOn :: Env -> X -> Day -> IO [Ship]
+getShipmentsOn env x d = do
   let f day = formatTime defaultTimeLocale (iso8601DateFormat Nothing) (UTCTime day 0)
   let pad = \case [c] -> '0':[c]; s -> s
-  let times = ["T" ++ pad (show h) ++ ":00:00Z" | h <- [0..23]]
+  let range = case x of Full -> [0..23]; Morning -> [0..12]; Evening -> [12..23]
+  let times = ["T" ++ pad (show h) ++ ":00:00Z" | h <- range]
   let call d1 t1 d2 t2 = do
         let s1 = f d1 ++ t1
         let s2 = f d2 ++ t2
         let query = "adjusted_ordered_at__ge=" ++ s1 ++ "&adjusted_ordered_at__lt=" ++ s2
         snd <$> getCollection env ("/shipments/?limit=300&" ++ query)
   let
-    go [t] = [call d t (addDays 1 d) "T00:00:00Z"]
+    last = case x of Morning -> d; _ -> addDays 1 d
+    go [t] = [call d t last "T00:00:00Z"]
     go (t1:t2:ts) = call d t1 d t2 : go (t2 : ts)
   concat <$> sequence (go times)
 
@@ -258,7 +289,16 @@ getShipments :: Env -> Day -> Day -> IO [Ship]
 getShipments env d1 d2 = do
   info "Fetching shipments from Cratejoy..."
   let days = daysBetween d1 d2
-  concat <$> mapM (getShipmentsOn env) days
+  concat <$> mapM (getShipmentsOn env Full) days
+  {-
+  case days of
+    d : ds -> do
+      ships <- getShipmentsOn env Full d
+      shipss <- mapM (getShipmentsOn env Full) (init ds)
+      lastships <- getShipmentsOn env Full (last ds)
+      return (ships ++ concat shipss ++ lastships)
+    _ -> error "Bigger interval needed"
+  -}
 
 -----------------------------------------------------------------------------
 -- Preferences
@@ -381,13 +421,13 @@ addGames games meta =
   let collection = nub $ game_collection meta ++ games in
   meta {game_collection = collection, wishlist = wishlist meta \\ collection}
 
-getCustomerMetadata :: Env -> Bool -> Customer -> IO Metadata
-getCustomerMetadata env warnIfNoMetadata cust = do
-  x <- try $ get env ("/customers/" ++ show (id cust) ++ "/metadata/")
+getCustomerMetadata :: Env -> Bool -> CustomerId -> IO Metadata
+getCustomerMetadata env warnIfNoMetadata cid = do
+  x <- try $ get env ("/customers/" ++ show cid ++ "/metadata/")
   case x of
     Left (StatusCodeException s _ _)
       | s ^. Wreq.statusCode == 404 -> do
-         when warnIfNoMetadata $ warnCustomer cust "no metadata for customer!"
+         when warnIfNoMetadata $ warnCustomer cid "no metadata for customer!"
          pure defaultMetadata
     Left e -> throwIO e
     Right r ->
@@ -526,10 +566,10 @@ instance Csv.FromNamedRecord ShipmentRecord where
     let game = Game {gameId, gameTitle}
     pure (ShipmentRecord customer address game)
 
-toShipmentRecord :: (Customer, InventoryGame, Address) -> ShipmentRecord
-toShipmentRecord (cust, igame, address) = ShipmentRecord cust address (game igame)
+toShipmentRecord :: (Ship, InventoryGame) -> ShipmentRecord
+toShipmentRecord (ship, igame) = ShipmentRecord (shipCustomer ship) (shipAddress ship) (game igame)
 
-writeShipmentFile :: FilePath -> [(Customer, InventoryGame, Address)] -> IO ()
+writeShipmentFile :: FilePath -> [(Ship, InventoryGame)] -> IO ()
 writeShipmentFile fp = BL.writeFile fp . Csv.encodeDefaultOrderedByName . map toShipmentRecord
 
 readShipmentFile :: FilePath -> IO [ShipmentRecord]
@@ -542,9 +582,32 @@ readShipmentFile fp = do
 updateCollection :: Env -> ShipmentRecord -> IO ()
 updateCollection env (ShipmentRecord customer _ game) = do
   -- XXX: race condition
-  meta <- getCustomerMetadata env True customer
+  let cid = id customer
+  meta <- getCustomerMetadata env True cid
   let meta' = addGames [game] meta
-  postCustomerMetadata env (id customer) meta'
+  postCustomerMetadata env cid meta'
+
+-----------------------------------------------------------------------------
+-- Cratejoy shipment file
+-----------------------------------------------------------------------------
+
+{-
+data CShipmentRecord = CShipmentRecord {cshipId :: Int, cshipCustId :: Int}
+  deriving Show
+
+instance Csv.FromNamedRecord CShipmentRecord where
+  parseNamedRecord m = do
+    id <- Csv.lookup m "id"
+    custId <- Csv.lookup m "customer_id"
+    pure (CShipmentRecord id custId)
+
+readCShipmentFile :: FilePath -> IO [CShipmentRecord]
+readCShipmentFile fp = do
+  bs <- BL.readFile fp
+  case Csv.decodeByName bs of
+    Left msg -> exit ("Failed to decode shipment CSV file: " <> toS msg)
+    Right (_, v) -> pure $ Vector.toList v
+-}
 
 -----------------------------------------------------------------------------
 -- Matching algorithm
@@ -559,32 +622,32 @@ score prefs game =
     aspectScore f b = let x = f prefs in if b game then x else 4 - x
     isCategory c g = c == category g
 
-customerScores :: [InventoryGame] -> (Customer, Metadata) -> [(Customer, InventoryGame, Int)]
-customerScores games (c, meta) = [(c, ig, score prefs ig) | ig <- games, notInCollection ig]
+customerScores :: [InventoryGame] -> (Ship, Metadata) -> [(Ship, InventoryGame, Int)]
+customerScores games (ship, meta) = [(ship, ig, score prefs ig) | ig <- games, notInCollection ig]
   where
     collection = map gameId (game_collection meta)
     notInCollection ig = gameId (game ig) `notElem` collection
     prefs = preferences meta
 
-allocateGames :: [InventoryGame] -> [(Customer, InventoryGame, Int)] -> [(Customer, InventoryGame)]
+allocateGames :: [InventoryGame] -> [(Ship, InventoryGame, Int)] -> [(Ship, InventoryGame)]
 allocateGames games rankings =
   let state = HashMap.fromList [(gameId (game ig), n) | ig <- games, let n = inventory ig, n > 0] in
   alloc state rankings
 
-alloc :: HashMap ItemId Int -> [(Customer, InventoryGame, Int)] -> [(Customer, InventoryGame)]
+alloc :: HashMap ItemId Int -> [(Ship, InventoryGame, Int)] -> [(Ship, InventoryGame)]
 alloc _ [] = []
-alloc inventory ((customer, ig, _) : rest)
+alloc inventory ((shipment, ig, _) : rest)
   | Just n <- HashMap.lookup (gameId (game ig)) inventory, n > 0 =
       let n' = max 0 (n-1)
           inventory' = HashMap.insert (gameId (game ig)) n' inventory
-          rest' = filter (\(c,_,_) -> c /= customer) rest
+          rest' = filter (\(ship,_,_) -> ship /= shipment) rest
       in
-      (customer, ig) : alloc inventory' rest'
+      (shipment, ig) : alloc inventory' rest'
   | otherwise = alloc inventory rest
 
-match :: [InventoryGame] -> [(Customer, Metadata)] -> [(Customer, InventoryGame)]
-match games customers =
-  let rankings = concatMap (customerScores games) customers in
+match :: [InventoryGame] -> [(Ship, Metadata)] -> [(Ship, InventoryGame)]
+match games shipments =
+  let rankings = concatMap (customerScores games) shipments in
   let sorted_rankings = sortBy (flip $ comparing (\(_,_,x) -> x)) rankings in
   allocateGames games sorted_rankings
 
@@ -656,8 +719,8 @@ queryBGG username tries = do
 getBGGCollection :: Text -> IO [Game]
 getBGGCollection username = queryBGG username 10
 
-updateUsernameAndCollection :: Env -> Text -> Customer -> Metadata -> IO Metadata
-updateUsernameAndCollection env username customer meta = do
+updateUsernameAndCollection :: Env -> Text -> CustomerId -> Metadata -> IO Metadata
+updateUsernameAndCollection env username cid meta = do
   -- there can be duplicates in the BGG collection
   bgg_collection <- nub <$> getBGGCollection username
   let additional_games = bgg_collection \\ game_collection meta
@@ -665,22 +728,23 @@ updateUsernameAndCollection env username customer meta = do
     --info "Metadata already up-to-date for customer. Skipping."
     pure meta
   else do
-    infoCustomer customer "Updating meta data for customer."
+    infoCustomer cid "Updating meta data for customer."
     let meta' = addGames additional_games meta {bgg_username = username}
-    postCustomerMetadata env (id customer) meta'
+    postCustomerMetadata env cid meta'
     pure meta'
 
-refreshCollection :: Env -> Customer -> Metadata -> IO Metadata
-refreshCollection env customer meta = do
+refreshCollection :: Env -> CustomerId -> Metadata -> IO Metadata
+refreshCollection env cid meta = do
   let username = bgg_username meta
   if username == "" then pure meta else
-    updateUsernameAndCollection env username customer meta
+    updateUsernameAndCollection env username cid meta
 
 importUsernameAndCollection :: Env -> HashMap Text Text -> Customer -> IO ()
 importUsernameAndCollection env hashmap customer = do
-  meta <- getCustomerMetadata env False customer
+  let cid = id customer
+  meta <- getCustomerMetadata env False cid
   case HashMap.lookup (name customer) hashmap of
-    Just username | username /= "" -> void $ updateUsernameAndCollection env username customer meta
+    Just username | username /= "" -> void $ updateUsernameAndCollection env username cid meta
     _ -> return () --info "No BGG username in CSV file, skipping customer."
 
 -----------------------------------------------------------------------------
@@ -696,13 +760,13 @@ info msg = do log msg; putStrLn (toS msg)
 warn :: Text -> IO ()
 warn msg = do Logging.warn msg; putStrLn ("Warning: " ++ toS msg)
 
-xxxCustomer :: (Text -> IO ()) -> Customer -> Text -> IO ()
-xxxCustomer f c msg = f (msg <> " Name: " <> name c <> ", ID: " <> toS (show (id c)))
+xxxCustomer :: (Text -> IO ()) -> CustomerId -> Text -> IO ()
+xxxCustomer f cid msg = f (msg <> " ID: " <> toS (show cid))
 
-warnCustomer :: Customer -> Text -> IO ()
+warnCustomer :: CustomerId -> Text -> IO ()
 warnCustomer = xxxCustomer warn
 
-infoCustomer :: Customer -> Text -> IO ()
+infoCustomer :: CustomerId -> Text -> IO ()
 infoCustomer = xxxCustomer info
 
 exit :: Text -> IO a
@@ -740,7 +804,7 @@ doImport env fp = do
       info "Uploading BGG usernames and collections to Cratejoy..."
       mapM_ (importUsernameAndCollection env hashmap) customers
 
-doRefresh :: Env -> IO [(Customer, Metadata)]
+doRefresh :: Env -> IO [(CustomerId, Metadata)]
 doRefresh env = do
   log "Executing refresh command"
   customers <- getCustomers env
@@ -754,9 +818,10 @@ doRefresh env = do
   active_customers <- filterM active customers
   info ("Number of active customers: " <> toS (show (length active_customers)))
   info "Getting metadata..."
-  customers_with_meta <- mapM (\c -> (c,) <$> getCustomerMetadata env True c) active_customers
+  let customer_ids = map id active_customers
+  customers_with_meta <- mapM (\id -> (id,) <$> getCustomerMetadata env True id) customer_ids
   info "Updating game collections from BGG..."
-  let actions = map (\(c,m) -> do m' <- refreshCollection env c m; pure (Just (c, m'))) customers_with_meta
+  let actions = map (\(id,m) -> do m' <- refreshCollection env id m; pure (Just (id, m'))) customers_with_meta
   let actions' = intersperse (do threadDelay 1000000; pure Nothing) actions
   catMaybes <$> sequence actions'
 
@@ -764,31 +829,39 @@ doShipment :: Env -> FilePath -> String -> String -> IO ()
 doShipment env fp t1 t2 = do
   log "Executing shipment command"
   let f = utctDay . parseTimeOrError True defaultTimeLocale (iso8601DateFormat Nothing)
-  let d1 = f t1
-  let d2 = f t2
+  let (d1, d2) = (f t1, f t2)
   info "Reading games CSV file..."
   games <- readGames fp
   shipments <- getShipments env d1 d2
   let shipments' = sort shipments
-  mapM_ (\Ship {shipAdjustedOrderedAt = CratejoyDateTime utc, shipStatus, shipCustomer} ->
-    let s = toS $ formatTime defaultTimeLocale (iso8601DateFormat Nothing) utc in
-    putStrLn (toS (s <> " " <> shipStatus <> " " <> name shipCustomer))
-    ) shipments'
-  info ("Number of shipments: " <> toS (show (length shipments)))
+  let shipments'' = filter (not . shipIsTest) shipments'
+  let gameboxes = [19988034, 759409]
+  let shipments''' = filter (any (`elem` gameboxes) . map (product_id . fulInstance) . shipFulfillments) shipments''
+  info ("Number of shipments: " <> toS (show (length shipments''')))
   {-
-  customers <- doRefresh env
+  stuff <- readCShipmentFile "cshipments.csv"
+  let theirs = map (\x -> (cshipId x, cshipCustId x)) stuff
+  let ours = map (\x -> (shipId x, id (shipCustomer x))) shipments''
+  let extra = ours \\ theirs
+  print extra
+  -}
+  info "Getting metadata..."
+  let customer_ids = nub $ map (id . shipCustomer) shipments'''
+  customers_with_meta <- mapM (\id -> (id,) <$> getCustomerMetadata env True id) customer_ids
+  info "Updating game collections from BGG..."
+  let actions = map (\(id,m) -> do m' <- refreshCollection env id m; pure (Just (id, m'))) customers_with_meta
+  let actions' = intersperse (do threadDelay 1000000; pure Nothing) actions
+  customers_with_meta' <- catMaybes <$> sequence actions'
+  let meta_map = HashMap.fromList customers_with_meta'
+  let ship_meta = [ (ship, fromJust $ HashMap.lookup (id (shipCustomer ship)) meta_map) | ship <- shipments''']
   info "Matching and allocating games..."
-  let allocated_games = match games customers
-  if length allocated_games == length customers then do
-    with_addresses <-
-      dots "Getting customer addresses..." $
-      mapM (\(u, g) -> do a <- getShippingAddress env u; pure (u, g, a)) allocated_games
+  let allocated_games = match games ship_meta
+  if length allocated_games == length ship_meta then do
     info "Writing shipment.csv..."
-    writeShipmentFile "shipment.csv" with_addresses
+    writeShipmentFile "shipment.csv" allocated_games
   else
-    let customers_without = map fst customers \\ map fst allocated_games in
-    exit ("Couldn't find games for all customers! Customers without games: " <> Text.pack (show customers_without))
-    -}
+    let without = map shipId (map fst ship_meta \\ map fst allocated_games) in
+    exit ("Couldn't find games for all shipments! Shipments without games: " <> Text.pack (show without))
 
 doCommit :: Env -> FilePath -> IO ()
 doCommit env fp = do

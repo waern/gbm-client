@@ -8,6 +8,7 @@ let env = haskellPackages.ghcWithPackages (p: with p; [
   http-types
   http-client
   wreq
+  curl
   aeson
   lens-aeson
   cassava

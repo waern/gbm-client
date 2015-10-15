@@ -39,6 +39,7 @@ import System.Console.CmdArgs hiding (name)
 import System.Exit
 import System.IO
 import Text.HTML.TagSoup
+import qualified Data.Aeson as Aeson
 import qualified Control.Logging as Logging
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.Configurator as Configurator
@@ -50,6 +51,7 @@ import qualified Network.HTTP.Client as HTTP.Client
 import qualified Network.HTTP.Types as HTTP.Types
 import qualified Network.Wreq as Wreq
 import qualified Network.Wreq.Session as Wreq.Session
+import Network.Curl
 
 -----------------------------------------------------------------------------
 -- Command line interface
@@ -93,12 +95,23 @@ cratejoyApiUrl = "https://api.cratejoy.com/v1"
 
 opts :: Auth -> Wreq.Options
 opts (user, pw) =
-  Wreq.defaults & Wreq.auth ?~ Wreq.basicAuth (toS user) (toS pw)
+  Wreq.defaults
+    & Wreq.auth ?~ Wreq.basicAuth (toS user) (toS pw)
+    & Wreq.manager . _Left %~ (\ms -> ms {managerResponseTimeout = Just (120 * 1000000)})
 
 get :: Env -> String -> IO (Wreq.Response BL.ByteString)
 get (aut, sess) service = do
   let uri = cratejoyApiUrl ++ service
   Wreq.Session.getWith (opts aut) sess uri
+
+-- Using CURL here as increasing the timeout with Wreq
+-- doesn't work for some reason
+getCurl :: (FromJSON a, ToJSON a) => Env -> String -> IO [a]
+getCurl ((user,pwd), _) url = do
+  (code, str) <- curlGetString url [CurlUserPwd (user ++ ":" ++ pwd)]
+  case decode (toS str) of
+    Nothing -> exit "failed to decode cratejoy JSON response"
+    Just (x :: Aeson.Value) -> return (x ^. key "results" . _JSON)
 
 post :: ToJSON a => Env -> String -> a -> IO ()
 post (aut, sess) service x = do
@@ -285,11 +298,21 @@ daysBetween d1 d2 =
       | a < b = a : daysBetween (addDays 1 a) b
       | otherwise = [a]
 
-getShipments :: Env -> Day -> Day -> IO [Ship]
+getShipments :: Env -> String -> String -> IO [Ship]
 getShipments env d1 d2 = do
+  {-
   info "Fetching shipments from Cratejoy..."
   let days = daysBetween d1 d2
   concat <$> mapM (getShipmentsOn env Full) days
+  -}
+  --let f day = formatTime defaultTimeLocale (iso8601DateFormat Nothing) (UTCTime day 0)
+  let s1 = d1 ++ "T00:00:00Z"
+  let s2 = d2 ++ "T00:00:00Z"
+  let query = "adjusted_ordered_at__ge=" ++ s1 ++ "&adjusted_ordered_at__lt=" ++ s2
+  info "Fetching shipments from Cratejoy..."
+  getCurl env (cratejoyApiUrl ++ "/shipments/?limit=10000&" ++ query)
+  --dots "Fetching shipments from Cratejoy..." $
+  --  getFullCollection env ("/shipments/?limit=10000&" ++ query)
   {-
   case days of
     d : ds -> do
@@ -828,11 +851,13 @@ doRefresh env = do
 doShipment :: Env -> FilePath -> String -> String -> IO ()
 doShipment env fp t1 t2 = do
   log "Executing shipment command"
+  {-
   let f = utctDay . parseTimeOrError True defaultTimeLocale (iso8601DateFormat Nothing)
   let (d1, d2) = (f t1, f t2)
+  -}
   info "Reading games CSV file..."
   games <- readGames fp
-  shipments <- getShipments env d1 d2
+  shipments <- getShipments env t1 t2
   let shipments' = sort shipments
   let shipments'' = filter (not . shipIsTest) shipments'
   let gameboxes = [19988034, 759409]

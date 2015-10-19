@@ -133,7 +133,7 @@ getFullCollection :: (FromJSON a, ToJSON a) => Env -> String -> IO [a]
 getFullCollection env service = go [] 0
   where
     go acc n = do
-      let url = if n == 0 then service else service ++ "&page=" ++ show n
+      let url = if n == 0 then service else service ++ "?page=" ++ show n
       (next, l) <- getCollection env url
       let acc' = l ++ acc
       case next of

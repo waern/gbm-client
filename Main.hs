@@ -474,9 +474,9 @@ data Category
 
 instance Csv.FromField Category where
   parseField = \case
-    "Popular" -> pure Popular
-    "Recent" -> pure Recent
-    "Forgotten" -> pure Forgotten
+    "Must Haves" -> pure Popular
+    "Recent Releases" -> pure Recent
+    "Hidden Gems" -> pure Forgotten
     _ -> mzero
 
 -- Break out classification part?

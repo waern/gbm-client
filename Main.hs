@@ -106,12 +106,32 @@ get (aut, sess) service = do
 
 -- Using CURL here as increasing the timeout with Wreq
 -- doesn't work for some reason
-getCurl :: (FromJSON a, ToJSON a) => Env -> String -> IO [a]
+getCurl :: (FromJSON a, ToJSON a) => Env -> String -> IO (Maybe String, [a])
 getCurl ((user,pwd), _) url = do
   (code, str) <- curlGetString url [CurlUserPwd (user ++ ":" ++ pwd)]
-  case decode (toS str) of
-    Nothing -> exit "failed to decode cratejoy JSON response"
-    Just (x :: Aeson.Value) -> return (x ^. key "results" . _JSON)
+  case code of
+    CurlOK ->
+      case decode (toS str) of
+        Nothing -> exit "failed to decode cratejoy JSON response"
+        Just (r :: Aeson.Value) -> do
+          let next = r ^? key "next" . nonNull . _String
+          results <-
+            case Aeson.fromJSON (fromJust (r ^? key "results")) of
+              Error err -> exit ("Failed to prase cratejoy JSON response: " <> toS err)
+              Success r -> pure r
+          pure (toS <$> next, results)
+    _ -> exit (toS $ show code)
+
+getFullCollectionCurl :: (FromJSON a, ToJSON a) => Env -> String -> IO [a]
+getFullCollectionCurl env service = go [] 1
+  where
+    go acc n = do
+      let url = if n == 1 then service else service ++ "&page=" ++ show n
+      (next, l) <- getCurl env url
+      let acc' = l ++ acc
+      case next of
+        Nothing -> pure acc'
+        Just _ -> do putChar '.'; go acc' (n + 1)
 
 post :: ToJSON a => Env -> String -> a -> IO ()
 post (aut, sess) service x = do
@@ -245,8 +265,8 @@ instance FromJSON Fulfillment where
   parseJSON _ = mzero
 
 data Ship = Ship
-  { shipAdjustedOrderedAt :: CratejoyDateTime
-  , shipId :: ItemId
+  { --shipAdjustedOrderedAt :: CratejoyDateTime
+    shipId :: ItemId
   , shipCustomer :: Customer
   , shipStatus :: Text
   , shipIsTest :: Bool
@@ -261,8 +281,9 @@ instance Eq Ship where
 instance FromJSON Ship where
   parseJSON (Object v) =
     Ship <$>
-      v .: "adjusted_ordered_at" <*>
-      v .: "id" <*> v .: "customer" <*>
+ --     v .: "adjusted_ordered_at" <*>
+      v .: "id" <*>
+      v .: "customer" <*>
       v .: "status" <*>
       v .: "is_test" <*>
       v .: "ship_address" <*>
@@ -310,7 +331,7 @@ getShipments env d1 d2 = do
   let s2 = d2 ++ "T00:00:00Z"
   let query = "adjusted_ordered_at__ge=" ++ s1 ++ "&adjusted_ordered_at__lt=" ++ s2
   info "Fetching shipments from Cratejoy..."
-  getCurl env (cratejoyApiUrl ++ "/shipments/?limit=10000&" ++ query)
+  getFullCollectionCurl env (cratejoyApiUrl ++ "/shipments/?with=customer,fulfillments&" ++ query)
   --dots "Fetching shipments from Cratejoy..." $
   --  getFullCollection env ("/shipments/?limit=10000&" ++ query)
   {-
@@ -716,6 +737,9 @@ queryBGG username tries = do
       retry
     Left HTTP.Client.ResponseTimeout -> do
       info ("Response timeout from BGG" `forUser` username)
+      retry
+    Left (HTTP.Client.InternalIOException e) -> do
+      info (toS (show e) `forUser` username)
       retry
     Left e ->
       throwIO e

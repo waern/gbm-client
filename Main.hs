@@ -514,7 +514,12 @@ data InventoryGame = InventoryGame
   } deriving Show
 
 xbool :: Csv.Parser String -> Csv.Parser Bool
-xbool p = p >>= \case "X" -> pure True; "" -> pure False; _ -> mzero
+xbool p =
+  p >>= \case
+    "X" -> pure True
+    "x" -> pure True
+    "" -> pure False
+    _ -> mzero
 
 instance Csv.FromRecord InventoryGame where
   parseRecord v

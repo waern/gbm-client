@@ -615,10 +615,10 @@ instance Csv.FromNamedRecord ShipmentRecord where
     let game = Game {gameId, gameTitle}
     pure (ShipmentRecord customer address game)
 
-toShipmentRecord :: (Ship, InventoryGame) -> ShipmentRecord
-toShipmentRecord (ship, igame) = ShipmentRecord (shipCustomer ship) (shipAddress ship) (game igame)
+toShipmentRecord :: (Ship, Game) -> ShipmentRecord
+toShipmentRecord (ship, g) = ShipmentRecord (shipCustomer ship) (shipAddress ship) g
 
-writeShipmentFile :: FilePath -> [(Ship, InventoryGame)] -> IO ()
+writeShipmentFile :: FilePath -> [(Ship, Game)] -> IO ()
 writeShipmentFile fp = BL.writeFile fp . Csv.encodeDefaultOrderedByName . map toShipmentRecord
 
 readShipmentFile :: FilePath -> IO [ShipmentRecord]
@@ -910,12 +910,17 @@ doShipment env fp t1 t2 = do
   let ship_meta = [ (ship, fromJust $ HashMap.lookup (id (shipCustomer ship)) meta_map) | ship <- shipments''']
   info "Matching and allocating games..."
   let allocated_games = match games ship_meta
-  if length allocated_games == length ship_meta then do
-    info "Writing shipment.csv..."
-    writeShipmentFile "shipment.csv" allocated_games
-  else
-    let without = map shipId (map fst ship_meta \\ map fst allocated_games) in
-    exit ("Couldn't find games for all shipments! Shipments without games: " <> Text.pack (show without))
+  let allocated_games' = map (\(ship, igame) -> (ship, game igame)) allocated_games
+  shipments <-
+    if length allocated_games' == length ship_meta then
+      return allocated_games'
+    else do
+      let without = map fst ship_meta \\ map fst allocated_games'
+      let ids = map shipId (map fst ship_meta \\ map fst allocated_games')
+      warn ("Couldn't find games for all shipments! Shipments without games: " <> Text.pack (show ids))
+      return (allocated_games' ++ map (\ship -> (ship, Game (-1) "NO MATCH")) without)
+  info "Writing shipment.csv..."
+  writeShipmentFile "shipment.csv" shipments
 
 doCommit :: Env -> FilePath -> IO ()
 doCommit env fp = do

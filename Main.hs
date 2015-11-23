@@ -707,11 +707,14 @@ match games shipments =
 forUser :: (Monoid a, IsString a) => a -> a -> a
 forUser msg username = msg <> fromString ", when querying collection for user: " <> username
 
-extractGame :: Text -> [Tag BL.ByteString] -> IO Game
+extractGame :: Text -> [Tag BL.ByteString] -> IO (Maybe Game)
 extractGame username = \case
-  (TagOpen "item" attrs : TagText _ : TagOpen "name" _ : TagText name : _)
+  (TagOpen "item" attrs : TagText _ : TagOpen "name" _ : TagText name : rest)
     | Just x <- lookup "objectid" attrs,
-      Just gameId <- readMay (toS x) -> pure Game {gameId, gameTitle = toS name}
+      Just gameId <- readMay (toS x),
+      (TagOpen "status" statusAttrs : _) : _ <- sections (~== ("<status>" :: String)) rest,
+      Just own <- lookup "own" statusAttrs
+      -> if own == "1" then pure (Just (Game {gameId, gameTitle = toS name})) else pure Nothing
   _ -> exit ("Unexpected BGG response" `forUser` username)
 
 extractGames :: Text -> BL.ByteString -> IO [Game]
@@ -719,7 +722,7 @@ extractGames username body = do
   let tags = parseTags body
   errors <- mapM message $ sections (~== ("<error>" :: String)) tags
   unless (null errors) (warn ("BGG API error: " <> Text.unlines errors `forUser` username))
-  mapM (extractGame username) $ sections (~== ("<item>" :: String)) tags
+  catMaybes <$> (mapM (extractGame username) $ sections (~== ("<item>" :: String)) tags)
   where
     text (_ : TagText str : _) = pure (Just str)
     text _ = do warn ("unexpected XML format" `forUser` username); pure Nothing

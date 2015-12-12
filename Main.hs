@@ -465,6 +465,10 @@ addGames games meta =
   let collection = nub $ game_collection meta ++ games in
   meta {game_collection = collection, wishlist = wishlist meta \\ collection}
 
+setGames :: [Game] -> Metadata -> Metadata
+setGames games meta =
+  meta {game_collection = games, wishlist = wishlist meta \\ games}
+
 getCustomerMetadata :: Env -> Bool -> CustomerId -> IO Metadata
 getCustomerMetadata env warnIfNoMetadata cid = do
   x <- try $ get env ("/customers/" ++ show cid ++ "/metadata/")
@@ -714,7 +718,7 @@ extractGame username = \case
       Just gameId <- readMay (toS x),
       (TagOpen "status" statusAttrs : _) : _ <- sections (~== ("<status>" :: String)) rest,
       Just own <- lookup "own" statusAttrs
-      -> if own == "1" then pure (Just (Game {gameId, gameTitle = toS name})) else pure Nothing
+      -> if own == "1" then pure (Just Game {gameId, gameTitle = toS name}) else pure Nothing
   _ -> exit ("Unexpected BGG response" `forUser` username)
 
 extractGames :: Text -> BL.ByteString -> IO [Game]
@@ -779,14 +783,26 @@ updateUsernameAndCollection env username cid meta = do
   -- there can be duplicates in the BGG collection
   bgg_collection <- nub <$> getBGGCollection username
   let additional_games = bgg_collection \\ game_collection meta
-  if username == bgg_username meta && null additional_games then
-    --info "Metadata already up-to-date for customer. Skipping."
+  if username == bgg_username meta && null additional_games then do
+    --infoCustomer cid "Metadata already up-to-date for customer. Skipping."
     pure meta
   else do
     infoCustomer cid "Updating meta data for customer."
     let meta' = addGames additional_games meta {bgg_username = username}
     postCustomerMetadata env cid meta'
     pure meta'
+
+-- Version that deletes games not in the BGG collection
+updateUsernameAndCollectionD :: Env -> Text -> CustomerId -> Metadata -> IO Metadata
+updateUsernameAndCollectionD env username cid meta = do
+  -- there can be duplicates in the BGG collection
+  bgg_collection <- nub <$> getBGGCollection username
+  let delete = length bgg_collection < length (game_collection meta)
+  infoCustomer cid "Updating meta data for customer."
+  when delete (infoCustomer cid "(Deleting games for customer!)")
+  let meta' = setGames bgg_collection meta {bgg_username = username}
+  postCustomerMetadata env cid meta'
+  pure meta'
 
 refreshCollection :: Env -> CustomerId -> Metadata -> IO Metadata
 refreshCollection env cid meta = do

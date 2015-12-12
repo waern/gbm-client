@@ -907,7 +907,7 @@ doShipment env fp t1 t2 = do
   games <- readGames fp
   shipments <- getShipments env t1 t2
   let shipments' = sort shipments
-  let shipments'' = filter (not . shipIsTest) shipments'
+  let shipments'' = filter (\ship -> not (shipIsTest ship || shipStatus ship == "cancelled")) shipments'
   let gameboxes = [19988034, 759409]
   let shipments''' = filter (any (`elem` gameboxes) . map (product_id . fulInstance) . shipFulfillments) shipments''
   info ("Number of shipments: " <> toS (show (length shipments''')))

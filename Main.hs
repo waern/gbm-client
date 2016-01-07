@@ -15,9 +15,11 @@ import Control.Lens hiding ((+=), (.=), to)
 import Control.Monad
 import Data.Aeson
 import Data.Aeson.Lens
+import Data.ByteString (ByteString)
 import Data.Csv ((.!))
 import Data.Function hiding (id)
 import Data.HashMap.Strict (HashMap)
+import Data.HashSet (HashSet)
 import Data.List
 import Data.Maybe
 import Data.Monoid
@@ -29,6 +31,7 @@ import Data.Text (Text)
 import Data.Time
 import Data.Time.Format
 import Data.Time.Clock.POSIX
+import Data.Vector (Vector)
 import GHC.Generics hiding (to)
 import Network.URI
 import Network.HTTP.Client
@@ -45,6 +48,7 @@ import qualified Data.ByteString.Lazy as BL
 import qualified Data.Configurator as Configurator
 import qualified Data.Csv as Csv
 import qualified Data.HashMap.Strict as HashMap
+import qualified Data.HashSet as HashSet
 import qualified Data.Text as Text
 import qualified Data.Vector as Vector
 import qualified Network.HTTP.Client as HTTP.Client
@@ -63,11 +67,12 @@ data CLI
   | Shipment {games :: FilePath, t1 :: String, t2 :: String}
   | Commit {shipment :: FilePath}
   | Refresh
+  | Collections {t1 :: String, t2 :: String}
   deriving (Show, Data)
 
 interface :: CLI
 interface =
-  modes [customers, imp, shipment, commit, refresh]
+  modes [customers, imp, shipment, commit, refresh, collections]
   &= summary "crateman v1.0"
   &= verbosity
   where
@@ -76,6 +81,7 @@ interface =
     shipment = Shipment {games = def &= argPos 0 &= typFile, t1 = def &= argPos 2, t2 = def &= argPos 3} &= help "Make shipment.csv, taking game inventory CSV file as input"
     commit = Commit {shipment = def &= argPos 1 &= typFile} &= help "Commit shipment information, taking a shipment CSV file as input"
     refresh = Refresh &= help "Refresh game collections from boardgamegeek.com"
+    collections = Collections {t1 = def &= argPos 0, t2 = def &= argPos 1} &= help "Write customer collections to collections.csv"
 
 -----------------------------------------------------------------------------
 -- Cratejoy API helpers
@@ -330,8 +336,8 @@ getShipments env d1 d2 = do
   let s1 = d1 ++ "T00:00:00Z"
   let s2 = d2 ++ "T00:00:00Z"
   let query = "adjusted_ordered_at__ge=" ++ s1 ++ "&adjusted_ordered_at__lt=" ++ s2
-  info "Fetching shipments from Cratejoy..."
-  getFullCollectionCurl env (cratejoyApiUrl ++ "/shipments/?with=customer,fulfillments&" ++ query)
+  dots "Fetching shipments from Cratejoy..." $
+    getFullCollectionCurl env (cratejoyApiUrl ++ "/shipments/?with=customer,fulfillments&" ++ query)
   --dots "Fetching shipments from Cratejoy..." $
   --  getFullCollection env ("/shipments/?limit=10000&" ++ query)
   {-
@@ -810,6 +816,15 @@ refreshCollection env cid meta = do
   if username == "" then pure meta else
     updateUsernameAndCollection env username cid meta
 
+refreshCollections :: Env -> [Customer] -> IO [(Customer, Metadata)]
+refreshCollections env customers = do
+  info "Getting metadata..."
+  customers_with_meta <- mapM (\c -> (c,) <$> getCustomerMetadata env True (id c)) customers
+  info "Updating game collections from BGG..."
+  let actions = map (\(c,m) -> do m' <- refreshCollection env (id c) m; pure (Just (c, m'))) customers_with_meta
+  let actions' = intersperse (do threadDelay 1000000; pure Nothing) actions
+  catMaybes <$> sequence actions'
+
 importUsernameAndCollection :: Env -> HashMap Text Text -> Customer -> IO ()
 importUsernameAndCollection env hashmap customer = do
   let cid = id customer
@@ -854,6 +869,29 @@ dots msg x = do
   pure r
 
 -----------------------------------------------------------------------------
+-- Commonality between commands
+-----------------------------------------------------------------------------
+
+getShipmentsAndCustomers :: Env -> String -> String -> IO ([Ship], [(Customer, Metadata)])
+getShipmentsAndCustomers env t1 t2 = do
+  shipments <- getShipments env t1 t2
+  let shipments' = sort shipments
+  let shipments'' = filter (\ship -> not (shipIsTest ship || shipStatus ship == "cancelled")) shipments'
+  let gameboxes = [19988034, 759409]
+  let shipments''' = filter (any (`elem` gameboxes) . map (product_id . fulInstance) . shipFulfillments) shipments''
+  info ("Number of shipments: " <> toS (show (length shipments''')))
+  {-
+  stuff <- readCShipmentFile "cshipments.csv"
+  let theirs = map (\x -> (cshipId x, cshipCustId x)) stuff
+  let ours = map (\x -> (shipId x, id (shipCustomer x))) shipments''
+  let extra = ours \\ theirs
+  print extra
+  -}
+  let customer_ids = nub $ map shipCustomer shipments'''
+  customers_with_meta <- refreshCollections env customer_ids
+  pure (shipments''', customers_with_meta)
+
+-----------------------------------------------------------------------------
 -- Commands
 -----------------------------------------------------------------------------
 
@@ -875,7 +913,7 @@ doImport env fp = do
       info "Uploading BGG usernames and collections to Cratejoy..."
       mapM_ (importUsernameAndCollection env hashmap) customers
 
-doRefresh :: Env -> IO [(CustomerId, Metadata)]
+doRefresh :: Env -> IO [(Customer, Metadata)]
 doRefresh env = do
   log "Executing refresh command"
   customers <- getCustomers env
@@ -888,13 +926,7 @@ doRefresh env = do
   let active c = or <$> mapM isActive (HashMap.lookupDefault [] (id c) stmap)
   active_customers <- filterM active customers
   info ("Number of active customers: " <> toS (show (length active_customers)))
-  info "Getting metadata..."
-  let customer_ids = map id active_customers
-  customers_with_meta <- mapM (\id -> (id,) <$> getCustomerMetadata env True id) customer_ids
-  info "Updating game collections from BGG..."
-  let actions = map (\(id,m) -> do m' <- refreshCollection env id m; pure (Just (id, m'))) customers_with_meta
-  let actions' = intersperse (do threadDelay 1000000; pure Nothing) actions
-  catMaybes <$> sequence actions'
+  refreshCollections env active_customers
 
 doShipment :: Env -> FilePath -> String -> String -> IO ()
 doShipment env fp t1 t2 = do
@@ -905,28 +937,10 @@ doShipment env fp t1 t2 = do
   -}
   info "Reading games CSV file..."
   games <- readGames fp
-  shipments <- getShipments env t1 t2
-  let shipments' = sort shipments
-  let shipments'' = filter (\ship -> not (shipIsTest ship || shipStatus ship == "cancelled")) shipments'
-  let gameboxes = [19988034, 759409]
-  let shipments''' = filter (any (`elem` gameboxes) . map (product_id . fulInstance) . shipFulfillments) shipments''
-  info ("Number of shipments: " <> toS (show (length shipments''')))
-  {-
-  stuff <- readCShipmentFile "cshipments.csv"
-  let theirs = map (\x -> (cshipId x, cshipCustId x)) stuff
-  let ours = map (\x -> (shipId x, id (shipCustomer x))) shipments''
-  let extra = ours \\ theirs
-  print extra
-  -}
-  info "Getting metadata..."
-  let customer_ids = nub $ map (id . shipCustomer) shipments'''
-  customers_with_meta <- mapM (\id -> (id,) <$> getCustomerMetadata env True id) customer_ids
-  info "Updating game collections from BGG..."
-  let actions = map (\(id,m) -> do m' <- refreshCollection env id m; pure (Just (id, m'))) customers_with_meta
-  let actions' = intersperse (do threadDelay 1000000; pure Nothing) actions
-  customers_with_meta' <- catMaybes <$> sequence actions'
-  let meta_map = HashMap.fromList customers_with_meta'
-  let ship_meta = [ (ship, fromJust $ HashMap.lookup (id (shipCustomer ship)) meta_map) | ship <- shipments''']
+
+  (shipments''', customers_with_meta) <- getShipmentsAndCustomers env t1 t2
+  let meta_map = HashMap.fromList (map (\(c,m) -> (id c, m)) customers_with_meta)
+  let ship_meta = [ (ship, fromJust $ HashMap.lookup (id $ shipCustomer ship) meta_map) | ship <- shipments''']
   info "Matching and allocating games..."
   let allocated_games = match games ship_meta
   let allocated_games' = map (\(ship, igame) -> (ship, game igame)) allocated_games
@@ -947,6 +961,26 @@ doCommit env fp = do
   info "Reading shipment CSV file..."
   shipment <- readShipmentFile fp
   mapM_ (updateCollection env) shipment
+
+doCollections :: Env -> String -> String -> IO ()
+doCollections env t1 t2 = do
+  log "Executing collections command"
+  (_, customers_with_meta) <- getShipmentsAndCustomers env t1 t2
+  let games = nub $ concat $ map (game_collection . snd) customers_with_meta
+  let game_name :: Game -> ByteString
+      game_name g = toS (gameTitle g <> " (" <> Text.pack (show (gameId g)) <> ")")
+  let header :: Vector ByteString = Vector.fromList ("" : map game_name games)
+  let set = HashSet.fromList [(id c, gameId g) | (c, m) <- customers_with_meta, g <- game_collection m]
+  let mark :: Customer -> Game -> ByteString
+      mark c g = if (id c, gameId g) `HashSet.member` set then "X" else ""
+  let row (c, m) = HashMap.fromList $ ("", toS (name c)) : [(game_name g, mark c g) | g <- games]
+  let rows = map row customers_with_meta
+  let csv = Csv.encodeByName header rows
+  BL.writeFile "collections.csv" csv
+
+-----------------------------------------------------------------------------
+-- Entry point
+-----------------------------------------------------------------------------
 
 readConfig :: IO Auth
 readConfig = do
@@ -969,3 +1003,4 @@ main = do
         Shipment fp t1 t2 -> doShipment env fp t1 t2
         Commit fp -> doCommit env fp
         Refresh -> void $ doRefresh env
+        Collections t1 t2 -> doCollections env t1 t2

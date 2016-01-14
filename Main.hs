@@ -55,6 +55,7 @@ import qualified Network.HTTP.Client as HTTP.Client
 import qualified Network.HTTP.Types as HTTP.Types
 import qualified Network.Wreq as Wreq
 import qualified Network.Wreq.Session as Wreq.Session
+import qualified System.Console.CmdArgs as CmdArgs
 import Network.Curl
 
 -----------------------------------------------------------------------------
@@ -65,23 +66,50 @@ data CLI
   = Customers
   | Import {users :: FilePath}
   | Shipment {games :: FilePath, t1 :: String, t2 :: String}
-  | Commit {shipment :: FilePath}
+  | Commit {shipments :: FilePath}
   | Refresh
-  | Collections {t1 :: String, t2 :: String}
+  | Collections {t1 :: String, t2 :: String, gid :: Maybe Int}
   deriving (Show, Data)
+
+customers :: CLI
+customers = Customers &= help "Write customer list to customers.csv"
+
+imp :: CLI
+imp =
+  Import {users = def &= argPos 2 &= typFile} &=
+  help "Import BGG user names from CSV file and update collections"
+
+shipment :: CLI
+shipment =
+  Shipment
+    { games = def &= argPos 0 &= typFile
+    , t1 = def &= argPos 2
+    , t2 = def &= argPos 3
+    } &=
+  help "Make shipment.csv, taking game inventory CSV file as input"
+
+commit :: CLI
+commit =
+  Commit {shipments = def &= argPos 1 &= typFile} &=
+  help "Commit shipment information, taking a shipment CSV file as input"
+
+refresh :: CLI
+refresh = Refresh &= help "Refresh game collections from boardgamegeek.com"
+
+collections :: CLI
+collections =
+  Collections
+    { t1 = def &= argPos 0
+    , t2 = def &= argPos 1
+    , gid = def &= CmdArgs.name "game"
+    } &=
+  help "Write customer collections to collections.csv"
 
 interface :: CLI
 interface =
-  modes [customers, imp, shipment, commit, refresh, collections]
-  &= summary "crateman v1.0"
-  &= verbosity
-  where
-    customers = Customers &= help "Write customer list to customers.csv"
-    imp = Import {users = def &= argPos 2 &= typFile} &= help "Import BGG user names from CSV file and update collections"
-    shipment = Shipment {games = def &= argPos 0 &= typFile, t1 = def &= argPos 2, t2 = def &= argPos 3} &= help "Make shipment.csv, taking game inventory CSV file as input"
-    commit = Commit {shipment = def &= argPos 1 &= typFile} &= help "Commit shipment information, taking a shipment CSV file as input"
-    refresh = Refresh &= help "Refresh game collections from boardgamegeek.com"
-    collections = Collections {t1 = def &= argPos 0, t2 = def &= argPos 1} &= help "Write customer collections to collections.csv"
+  modes [customers, imp, shipment, commit, refresh, collections] &=
+  summary "crateman v1.0" &=
+  verbosity
 
 -----------------------------------------------------------------------------
 -- Cratejoy API helpers
@@ -962,8 +990,8 @@ doCommit env fp = do
   shipment <- readShipmentFile fp
   mapM_ (updateCollection env) shipment
 
-doCollections :: Env -> String -> String -> IO ()
-doCollections env t1 t2 = do
+doCollections :: Env -> String -> String -> Maybe Int -> IO ()
+doCollections env t1 t2 _ = do
   log "Executing collections command"
   (_, customers_with_meta) <- getShipmentsAndCustomers env t1 t2
   let games = nub $ concat $ map (game_collection . snd) customers_with_meta
@@ -1003,4 +1031,4 @@ main = do
         Shipment fp t1 t2 -> doShipment env fp t1 t2
         Commit fp -> doCommit env fp
         Refresh -> void $ doRefresh env
-        Collections t1 t2 -> doCollections env t1 t2
+        Collections t1 t2 gid -> doCollections env t1 t2 gid

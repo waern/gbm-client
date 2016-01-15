@@ -991,10 +991,20 @@ doCommit env fp = do
   mapM_ (updateCollection env) shipment
 
 doCollections :: Env -> String -> String -> Maybe Int -> IO ()
-doCollections env t1 t2 _ = do
+doCollections env t1 t2 gid = do
   log "Executing collections command"
   (_, customers_with_meta) <- getShipmentsAndCustomers env t1 t2
-  putStrLn ("Number of customers with shipments in date range: " ++ show (length customers_with_meta))
+  let nbCustomers = length customers_with_meta
+  putStrLn ("Number of customers with shipments in date range: " ++ show nbCustomers)
+
+  case gid of
+    Nothing -> pure ()
+    Just id -> do
+      let ids = map gameId . game_collection
+      let nbWithGame = length [ () | (c, meta) <- customers_with_meta, id `elem` ids meta]
+      let percentage = fromIntegral (100 * nbWithGame) / fromIntegral nbCustomers
+      putStrLn ("Percentage of customers that have this game: " ++ show percentage ++ "%")
+
   let games = nub $ concat $ map (game_collection . snd) customers_with_meta
   let game_name :: Game -> ByteString
       game_name g = toS (gameTitle g <> " (" <> Text.pack (show (gameId g)) <> ")")

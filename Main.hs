@@ -1006,14 +1006,17 @@ doCollections env t1 t2 gid = do
       putStrLn ("Percentage of customers that have this game: " ++ show percentage ++ "%")
 
   let games = nub $ concat $ map (game_collection . snd) customers_with_meta
+  let customers = map fst customers_with_meta
   let game_name :: Game -> ByteString
       game_name g = toS (gameTitle g <> " (" <> Text.pack (show (gameId g)) <> ")")
-  let header :: Vector ByteString = Vector.fromList ("" : map game_name games)
+  let cust_name :: Customer -> ByteString
+      cust_name c = toS (name c <> " (" <> Text.pack (show (id c)) <> ")")
+  let header :: Vector ByteString = Vector.fromList ("" : map cust_name customers)
   let set = HashSet.fromList [(id c, gameId g) | (c, m) <- customers_with_meta, g <- game_collection m]
   let mark :: Customer -> Game -> ByteString
       mark c g = if (id c, gameId g) `HashSet.member` set then "X" else ""
-  let row (c, m) = HashMap.fromList $ ("", toS (name c)) : [(game_name g, mark c g) | g <- games]
-  let rows = map row customers_with_meta
+  let row g = HashMap.fromList $ ("", toS (game_name g)) : [(cust_name c, mark c g) | c <- customers]
+  let rows = map row games
   let csv = Csv.encodeByName header rows
   BL.writeFile "collections.csv" csv
 

@@ -136,7 +136,13 @@ opts (user, pw) =
 get :: Env -> String -> IO (Wreq.Response BL.ByteString)
 get (aut, sess) service = do
   let uri = cratejoyApiUrl ++ service
-  Wreq.Session.getWith (opts aut) sess uri
+  r <- try $ Wreq.Session.getWith (opts aut) sess uri
+  case r of
+    Left HTTP.Client.ResponseTimeout -> do
+      info "Response timeout from Cratejoy. Trying again..."
+      get (aut, sess) service
+    Left e -> throwIO e
+    Right x -> pure x
 
 -- Using CURL here as increasing the timeout with Wreq
 -- doesn't work for some reason
